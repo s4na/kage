@@ -380,6 +380,7 @@ impl FuseServer {
 
     fn handle(&self, req: FuseInHeader, body: &[u8]) -> Option<Vec<u8>> {
         match req.opcode {
+            FUSE_LOOKUP if req.nodeid == 0 => Some(error_reply(req.unique, ENOENT)),
             FUSE_INIT => Some(self.init(req.unique)),
             FUSE_LOOKUP => Some(self.lookup(req.unique, req.nodeid, body)),
             FUSE_GETATTR => Some(self.getattr(req.unique, req.nodeid)),
@@ -389,7 +390,7 @@ impl FuseServer {
             FUSE_READLINK => Some(self.readlink(req.unique, req.nodeid)),
             FUSE_STATFS => Some(self.statfs(req.unique)),
             FUSE_RELEASE | FUSE_RELEASEDIR | FUSE_FLUSH => Some(empty_reply(req.unique)),
-            FUSE_DESTROY => None,
+            FUSE_FORGET | FUSE_DESTROY => None,
             FUSE_SETATTR | FUSE_MKDIR | FUSE_UNLINK | FUSE_RMDIR | FUSE_RENAME | FUSE_WRITE
             | FUSE_CREATE | FUSE_SYMLINK | FUSE_LINK => Some(error_reply(req.unique, EROFS)),
             _ => Some(error_reply(req.unique, ENOSYS)),
@@ -796,6 +797,7 @@ const DT_REG: u8 = 8;
 const DT_DIR: u8 = 4;
 const DT_LNK: u8 = 10;
 const FUSE_LOOKUP: u32 = 1;
+const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
 const FUSE_SETATTR: u32 = 4;
 const FUSE_READLINK: u32 = 5;
@@ -888,6 +890,71 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn lookup_request(name: &str) -> Vec<u8> {
+        let mut body = name.as_bytes().to_vec();
+        body.push(0);
+        body
+    }
+
+    fn read_request(offset: u64, size: u32) -> Vec<u8> {
+        let mut body = vec![0_u8; 40];
+        body[8..16].copy_from_slice(&offset.to_ne_bytes());
+        body[24..28].copy_from_slice(&size.to_ne_bytes());
+        body
+    }
+
+    fn status(reply: &[u8]) -> i32 {
+        i32::from_ne_bytes(reply[4..8].try_into().unwrap())
+    }
+
+    fn body(reply: &[u8]) -> &[u8] {
+        let len = u32_at(reply, 0) as usize;
+        assert_eq!(len, reply.len());
+        &reply[16..]
+    }
+
+    fn entry_ino(reply: &[u8]) -> u64 {
+        assert_eq!(status(reply), 0);
+        u64_at(body(reply), 0)
+    }
+
+    fn attr_mode(reply: &[u8]) -> u32 {
+        assert_eq!(status(reply), 0);
+        u32_at(body(reply), 76)
+    }
+
+    fn attr_size(reply: &[u8]) -> u64 {
+        assert_eq!(status(reply), 0);
+        u64_at(body(reply), 24)
+    }
+
+    fn data(reply: &[u8]) -> Vec<u8> {
+        assert_eq!(status(reply), 0);
+        body(reply).to_vec()
+    }
+
+    fn dirent_names(reply: &[u8]) -> Vec<String> {
+        assert_eq!(status(reply), 0);
+        let mut out = Vec::new();
+        let mut pos = 0;
+        let bytes = body(reply);
+        while pos + FUSE_DIRENT_SIZE <= bytes.len() {
+            let namelen = u32_at(bytes, pos + 16) as usize;
+            let name_start = pos + FUSE_DIRENT_SIZE;
+            let name_end = name_start + namelen;
+            if name_end > bytes.len() {
+                break;
+            }
+            out.push(String::from_utf8(bytes[name_start..name_end].to_vec()).unwrap());
+            pos += align8(FUSE_DIRENT_SIZE + namelen);
+        }
+        out
+    }
+
+    fn server_for(repo: &Path) -> FuseServer {
+        FuseServer::new(GitTreeView::open(repo, "main").unwrap())
+    }
+
     fn fixture_repo() -> PathBuf {
         let repo = temp("repo");
         fs::create_dir_all(repo.join("nested")).unwrap();
@@ -948,6 +1015,156 @@ mod tests {
         assert!(view.lookup(Path::new("../outside")).is_err());
         assert!(view.lookup(Path::new("/absolute")).is_err());
         assert!(view.lookup(Path::new(".git/config")).is_err());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn fuse_protocol_lookup_getattr_read_readlink_and_readdir_are_mount_free() {
+        let repo = fixture_repo();
+        let head_before = git_output(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let server = server_for(&repo);
+
+        let init = server
+            .handle(
+                FuseInHeader {
+                    opcode: FUSE_INIT,
+                    unique: 100,
+                    nodeid: 0,
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(status(&init), 0);
+        assert_eq!(u32_at(&init, 0), 80);
+
+        let root_attr = server.getattr(1, 1);
+        assert_eq!(attr_mode(&root_attr) & S_IFDIR, S_IFDIR);
+
+        let readme_a = server.lookup(2, 1, &lookup_request("README.md"));
+        let readme_b = server.lookup(3, 1, &lookup_request("README.md"));
+        let readme_ino = entry_ino(&readme_a);
+        assert_eq!(readme_ino, entry_ino(&readme_b));
+
+        let readme_attr = server.getattr(4, readme_ino);
+        assert_eq!(attr_mode(&readme_attr) & S_IFREG, S_IFREG);
+        assert_eq!(attr_mode(&readme_attr) & 0o777, 0o444);
+        assert_eq!(attr_size(&readme_attr), "hello world".len() as u64);
+
+        assert_eq!(
+            data(&server.read(5, readme_ino, &read_request(0, 99))),
+            b"hello world"
+        );
+        assert_eq!(
+            data(&server.read(6, readme_ino, &read_request(6, 5))),
+            b"world"
+        );
+        assert_eq!(data(&server.read(7, readme_ino, &read_request(99, 5))), b"");
+
+        let run_ino = entry_ino(&server.lookup(8, 1, &lookup_request("run.sh")));
+        let run_attr = server.getattr(9, run_ino);
+        assert_eq!(attr_mode(&run_attr) & S_IFREG, S_IFREG);
+        assert_eq!(attr_mode(&run_attr) & 0o111, 0o111);
+
+        let link_ino = entry_ino(&server.lookup(10, 1, &lookup_request("link")));
+        let link_attr = server.getattr(11, link_ino);
+        assert_eq!(attr_mode(&link_attr) & S_IFLNK, S_IFLNK);
+        assert_eq!(attr_size(&link_attr), "README.md".len() as u64);
+        assert_eq!(data(&server.readlink(12, link_ino)), b"README.md");
+
+        let root_names = dirent_names(&server.readdir(13, 1, &read_request(0, 4096)));
+        assert!(root_names.contains(&".".to_string()));
+        assert!(root_names.contains(&"..".to_string()));
+        assert!(root_names.contains(&"README.md".to_string()));
+        assert!(root_names.contains(&"nested".to_string()));
+        let continued_names = dirent_names(&server.readdir(14, 1, &read_request(2, 4096)));
+        assert!(!continued_names.contains(&".".to_string()));
+        assert!(!continued_names.contains(&"..".to_string()));
+
+        let nested_ino = entry_ino(&server.lookup(15, 1, &lookup_request("nested")));
+        let nested_names = dirent_names(&server.readdir(16, nested_ino, &read_request(0, 4096)));
+        assert!(nested_names.contains(&"file with spaces.txt".to_string()));
+        assert!(nested_names.contains(&"ユニコード.txt".to_string()));
+
+        assert_eq!(
+            status(&server.lookup(17, 1, &lookup_request("missing"))),
+            -ENOENT
+        );
+        let head_after = git_output(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head_before, head_after);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn fuse_protocol_binary_reads_and_mutations_are_read_only() {
+        let repo = fixture_repo();
+        let server = server_for(&repo);
+        let binary_ino = entry_ino(&server.lookup(20, 1, &lookup_request("binary.bin")));
+        assert_eq!(
+            data(&server.read(21, binary_ino, &read_request(0, 99))),
+            vec![0, 1, 2, 255]
+        );
+        assert_eq!(
+            data(&server.read(22, binary_ino, &read_request(2, 2))),
+            vec![2, 255]
+        );
+        let forget = server.handle(
+            FuseInHeader {
+                opcode: FUSE_FORGET,
+                unique: 23,
+                nodeid: binary_ino,
+            },
+            &[],
+        );
+        assert!(forget.is_none(), "FUSE_FORGET must not emit a reply");
+
+        for opcode in [
+            FUSE_SETATTR,
+            FUSE_MKDIR,
+            FUSE_UNLINK,
+            FUSE_RMDIR,
+            FUSE_RENAME,
+            FUSE_WRITE,
+            FUSE_CREATE,
+        ] {
+            let req = FuseInHeader {
+                opcode,
+                unique: u64::from(opcode),
+                nodeid: 1,
+            };
+            let reply = server.handle(req, &[]).unwrap();
+            assert_eq!(status(&reply), -EROFS, "opcode {opcode} must be read-only");
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn fuse_protocol_large_directory_and_large_file_are_mount_free() {
+        let repo = temp("large-repo");
+        fs::create_dir_all(repo.join("many")).unwrap();
+        run(&repo, &["init", "-b", "main"]);
+        run(&repo, &["config", "user.email", "kage@example.invalid"]);
+        run(&repo, &["config", "user.name", "kage test"]);
+        let large = "0123456789".repeat(1024);
+        fs::write(repo.join("large.txt"), &large).unwrap();
+        for idx in 0..64 {
+            fs::write(
+                repo.join(format!("many/file-{idx:02}.txt")),
+                idx.to_string(),
+            )
+            .unwrap();
+        }
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-m", "large"]);
+        let server = server_for(&repo);
+        let large_ino = entry_ino(&server.lookup(30, 1, &lookup_request("large.txt")));
+        assert_eq!(
+            data(&server.read(31, large_ino, &read_request(10, 10))),
+            b"0123456789"
+        );
+        let many_ino = entry_ino(&server.lookup(32, 1, &lookup_request("many")));
+        let names = dirent_names(&server.readdir(33, many_ino, &read_request(0, 16 * 1024)));
+        assert!(names.contains(&"file-00.txt".to_string()));
+        assert!(names.contains(&"file-63.txt".to_string()));
         fs::remove_dir_all(repo).unwrap();
     }
 

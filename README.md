@@ -276,6 +276,23 @@ cargo test --workspace --all-features
 
 The default test suite uses temporary Git repositories and does not require network access. Pure `GitTreeView` tests run by default. Rofs mount, overlayfs, container, and VM execution are environment-dependent. `KAGE_TEST_ROFS=1` requires a real rofs FUSE mount and fails if `/dev/fuse` or mount capability is missing. `KAGE_TEST_OVERLAY=1` requires a real overlayfs mount and fails if overlayfs or `CAP_SYS_ADMIN` is missing. Real Docker/Podman/Apple Container execution should be manually verified on the target host.
 
+### Verification levels
+
+- **Level 0:** default `cargo fmt`, `cargo clippy`, and `cargo test --workspace --all-features`. Proven in this environment.
+- **Level 1:** GitTreeView and mount-free rofs protocol tests. Proven in this environment.
+- **Level 2:** strict rofs FUSE mount tests with `KAGE_TEST_ROFS=1`. Not proven here because `/dev/fuse` is unavailable; allow-skip is not proof.
+- **Level 3:** strict overlayfs mount tests with `KAGE_TEST_OVERLAY=1`. Not proven here because overlay mount requires additional capability.
+- **Level 4:** strict rofs + overlay + commit-back tests with `KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1`. This is the first full runtime proof and is not proven here.
+- **Level 5:** managed Linux VM / Apple Silicon workflow validation. Future work.
+
+A privileged Docker route is provided for Linux hosts that can run nested mounts:
+
+```bash
+scripts/run-privileged-linux-tests.sh
+```
+
+This script runs default checks plus strict rofs, overlayfs, and combined rofs+overlay tests inside a privileged Linux container with `/dev/fuse` passed through. Hosted CI runners may not provide the required kernel capabilities; use a capable local Linux host, VM, or self-hosted runner.
+
 ## Development notes
 
 - Do not use `git checkout` or `git worktree` as the primary workspace mechanism.

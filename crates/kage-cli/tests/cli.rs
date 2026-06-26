@@ -226,3 +226,76 @@ fn workspace_create_records_exported_lower_and_rejects_git_rofs_with_fallback_ba
     fs::remove_dir_all(repo).unwrap();
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn git_rofs_overlay_startup_failure_does_not_record_workspace_or_fallback() {
+    let repo = setup_repo();
+    let home = temp("home");
+    let out = kage(
+        &home,
+        &[
+            "workspace",
+            "create",
+            "--ref",
+            "main",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--id",
+            "ws_rofs_overlay",
+            "--backend",
+            "overlayfs",
+            "--lower",
+            "git-rofs",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "git-rofs overlay create should fail without /dev/fuse or mount capability in default CI"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("kage-rofs daemon exited during mount")
+            || stderr.contains("/dev/fuse")
+            || stderr.contains("fuse mount failed")
+            || stderr.contains("permission"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!home
+        .join("workspaces/ws_rofs_overlay/workspace.tsv")
+        .exists());
+    assert!(repo.join(".git/objects").exists());
+    assert!(
+        !home
+            .join("workspaces/ws_rofs_overlay/lower/README.md")
+            .exists(),
+        "git-rofs must not silently export fallback lower"
+    );
+    fs::remove_dir_all(repo).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn rofs_serve_rejects_invalid_repo_ref_or_mountpoint() {
+    let home = temp("home");
+    let mount = temp("mount");
+    let out = kage(
+        &home,
+        &[
+            "rofs-serve",
+            "--repo",
+            "/definitely/missing/repo",
+            "--ref",
+            "missing-ref",
+            "--mountpoint",
+            mount.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("No such file or directory") || stderr.contains("git rev-parse"),
+        "unexpected stderr: {stderr}"
+    );
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(mount);
+}

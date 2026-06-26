@@ -253,6 +253,22 @@ mod tests {
     }
 
     #[test]
+    fn old_workspace_metadata_defaults_to_exported_lower() {
+        let root = temp("old-metadata");
+        let paths = RuntimePaths::new(&root);
+        paths.ensure().unwrap();
+        fs::create_dir_all(paths.workspace_dir("old_ws")).unwrap();
+        fs::write(
+            paths.metadata_path("old_ws"),
+            "id\told_ws\nrepo\t/repo\nreference\tmain\nparent\tabc\nlower\t/lower\nupper\t/upper\nwork\t/work\nmerged\t/merged\nbackend\tfallback\n",
+        )
+        .unwrap();
+        let ws = read_workspace(&paths, "old_ws").unwrap();
+        assert_eq!(ws.lower_kind, "exported");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn relative_paths_reject_traversal_absolute_and_git_metadata() {
         assert!(validate_relative_path(Path::new("src/lib.rs")).is_ok());
         assert!(validate_relative_path(Path::new("dir with spaces/ユニコード.txt")).is_ok());

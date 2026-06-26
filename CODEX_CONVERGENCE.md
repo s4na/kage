@@ -64,3 +64,75 @@
   - `KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture` failed on overlay mount permission denied.
   - allow-skip variants passed with explicit warnings.
 - Current blocker classification: ENVIRONMENT_BLOCKER.
+
+## Cycle 3
+
+- Failing gate: FUSE protocol behavior was not sufficiently proven without a kernel mount.
+- Classification: TEST_DEFECT.
+- Files inspected:
+  - `crates/kage-rofs/src/lib.rs`
+- Fix applied:
+  - added mount-free protocol tests for stable inode lookup, root inode, `FUSE_INIT`, `FUSE_FORGET`, getattr mode/size, full and offset reads, EOF reads, binary reads, exact readlink data, root and nested readdir, readdir offset continuation, Unicode/spaced names, missing lookup errno, read-only mutation errno, large-file partial reads, and large-directory readdir;
+  - corrected test ABI offsets for `fuse_attr.mode` and `fuse_attr.size` during the cycle.
+- Tests run:
+  - `cargo test -p kage-rofs --all-features` initially failed on incorrect test-side attr offsets;
+  - after fixing the offsets, `cargo test -p kage-rofs --all-features` passed.
+- Result: mount-free FUSE request/response behavior is now covered for the narrow read-only operations kage-rofs implements.
+- Remaining risk: kernel FUSE mount execution still requires `/dev/fuse`; the implementation remains hand-written and must be treated as higher risk until strict mount tests pass in a capable environment.
+
+## Cycle 4
+
+- Failing gate: rofs daemon lifecycle and CLI rollback behavior were under-tested without kernel mounts.
+- Classification: TEST_DEFECT.
+- Files inspected:
+  - `crates/kage-cli/src/main.rs`
+  - `crates/kage-cli/tests/cli.rs`
+- Fix applied:
+  - extracted `rofs_serve_command` so argument construction can be tested without shell interpolation;
+  - added a stale-pid cleanup/idempotency test for `stop_rofs_daemon`;
+  - added CLI integration tests proving invalid `rofs-serve` input fails clearly and `--backend overlayfs --lower git-rofs` does not record a workspace or silently export `lower/` when rofs startup fails.
+- Tests run:
+  - `cargo test -p kage-cli --all-features` passed.
+- Result: non-kernel CLI lifecycle and no-silent-fallback behavior are covered.
+- Remaining risk: real rofs-starts-then-overlay-fails rollback is still verified only by strict gated integration in a capable kernel environment.
+
+## Cycle 5
+
+- Failing gate: metadata migration and reviewer verification route were incomplete.
+- Classification: DOCUMENTATION_DEFECT.
+- Files inspected:
+  - `crates/kage-core/src/lib.rs`
+  - `README.md`
+  - `scripts/verify-rofs.sh`
+  - `scripts/verify-overlayfs.sh`
+  - `scripts/verify-rofs-overlay.sh`
+- Fix applied:
+  - added an old-workspace metadata test proving missing `lower_kind` defaults to `exported`;
+  - added README verification levels and explicitly stated that allow-skip is not proof;
+  - added `scripts/run-privileged-linux-tests.sh` as a concrete privileged Docker verification route for strict rofs/overlay/combined tests.
+- Tests run:
+  - `cargo test -p kage-core --lib` passed;
+  - the full default command chain passed.
+- Result: metadata compatibility and reviewer-facing verification instructions are improved.
+- Remaining risk: the privileged route requires a host with Docker, `/dev/fuse`, and mount capability; this container does not provide those kernel facilities.
+
+## Cycle 6
+
+- Failing gate: strict kernel mount tests still fail in the current container.
+- Classification: ENVIRONMENT_BLOCKER.
+- Files inspected:
+  - `crates/kage-rofs/src/lib.rs`
+  - `crates/kage-overlay/src/lib.rs`
+  - `scripts/verify-rofs.sh`
+  - `scripts/verify-rofs-overlay.sh`
+- Fix applied:
+  - narrowed strict-test failures to the kernel boundary after mount-free protocol/lifecycle/default tests passed;
+  - reran strict and allow-skip test variants;
+  - ran diagnostics proving `/dev/fuse` is unavailable and overlay mount returns permission denied.
+- Tests run:
+  - `KAGE_TEST_ROFS=1 cargo test --workspace --all-features -- --nocapture` failed only at the strict rofs mount body with `/dev/fuse is unavailable`;
+  - `KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture` failed only at strict overlay mount with permission denied;
+  - `KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture` failed for the same kernel-boundary reasons;
+  - allow-skip variants passed with explicit warnings.
+- Result: non-kernel gates are green; kernel mount verification remains blocked by the current environment.
+- Remaining risk: strict rofs, overlayfs, and combined rofs+overlay+commit-back behavior must be run on a privileged Linux host/VM before production claims.

@@ -205,18 +205,7 @@ fn start_rofs_daemon(ws: &WorkspaceSpec) -> Result<()> {
     let pid_path = root.join("rofs.pid");
     let err_path = root.join("rofs.stderr");
     let err = fs::File::create(&err_path)?;
-    let mut child = Command::new(exe)
-        .arg("rofs-serve")
-        .arg("--repo")
-        .arg(&ws.repo)
-        .arg("--ref")
-        .arg(&ws.parent_commit)
-        .arg("--mountpoint")
-        .arg(&ws.lower)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(err))
-        .spawn()?;
+    let mut child = rofs_serve_command(&exe, ws, err).spawn()?;
     fs::write(&pid_path, child.id().to_string())?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -236,6 +225,22 @@ fn start_rofs_daemon(ws: &WorkspaceSpec) -> Result<()> {
     let _ = child.wait();
     let _ = fs::remove_file(&pid_path);
     Err("timed out waiting for kage-rofs mount to become readable".into())
+}
+
+fn rofs_serve_command(exe: &Path, ws: &WorkspaceSpec, stderr: fs::File) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .arg("rofs-serve")
+        .arg("--repo")
+        .arg(&ws.repo)
+        .arg("--ref")
+        .arg(&ws.parent_commit)
+        .arg("--mountpoint")
+        .arg(&ws.lower)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr));
+    command
 }
 
 fn rofs_mount_ready(mountpoint: &Path) -> bool {
@@ -308,4 +313,63 @@ fn need(args: &[String], idx: usize) -> Result<&str> {
     args.get(idx)
         .map(String::as_str)
         .ok_or_else(|| "missing argument".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("kage-cli-unit-{name}-{nonce}"))
+    }
+
+    fn spec(root: &Path) -> WorkspaceSpec {
+        WorkspaceSpec {
+            id: "ws".to_string(),
+            repo: PathBuf::from("/repo path/with spaces"),
+            reference: "main".to_string(),
+            parent_commit: "abc123".to_string(),
+            lower: root.join("lower"),
+            upper: root.join("upper"),
+            work: root.join("work"),
+            merged: root.join("merged"),
+            backend: "overlayfs".to_string(),
+            lower_kind: "git-rofs".to_string(),
+        }
+    }
+
+    #[test]
+    fn rofs_serve_command_uses_argument_array() {
+        let root = temp("cmd");
+        fs::create_dir_all(&root).unwrap();
+        let stderr = fs::File::create(root.join("stderr")).unwrap();
+        let ws = spec(&root);
+        let command = rofs_serve_command(Path::new("/bin/kage"), &ws, stderr);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "rofs-serve");
+        assert_eq!(args[1], "--repo");
+        assert_eq!(args[2], "/repo path/with spaces");
+        assert!(args.contains(&"--mountpoint".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("sh -c")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stop_rofs_daemon_is_idempotent_for_stale_pid() {
+        let root = temp("stop");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("rofs.pid"), "999999").unwrap();
+        stop_rofs_daemon(&root).unwrap();
+        stop_rofs_daemon(&root).unwrap();
+        assert!(!root.join("rofs.pid").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
