@@ -227,7 +227,21 @@ KAGE_TEST_OVERLAY=1 cargo test -p kage-overlay overlayfs_detection_is_explicitly
 KAGE_TEST_OVERLAY=1 cargo test -p kage-git overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --nocapture
 ```
 
-If the host lacks overlay mount privilege, the integration body reports the mount error and exits without verifying the full overlay behavior. A real validation run should be performed on a Linux host or managed Linux VM with overlayfs mount capability.
+With `KAGE_TEST_OVERLAY=1`, the overlay integration test requires a real overlay mount and fails if the host lacks mount capability. For exploratory local runs where a permission-related skip is acceptable, set `KAGE_TEST_OVERLAY_ALLOW_SKIP=1`; the test prints an explicit warning before skipping the mount body. A real validation run should be performed on a Linux host or managed Linux VM with overlayfs mount capability.
+
+A manual privileged verification helper is available:
+
+```bash
+scripts/verify-overlayfs.sh
+```
+
+It prints kernel, identity, overlay availability, tempdir filesystem details, a direct mount probe, and then runs `KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture`.
+
+Xattr-based whiteout and opaque directory detection can be tested on filesystems that allow `trusted.overlay.*` xattrs and have `setfattr` installed:
+
+```bash
+KAGE_TEST_OVERLAY_XATTR=1 cargo test -p kage-git overlay_xattr_whiteout_and_opaque_directory_when_enabled -- --nocapture
+```
 
 ## Safety model
 
@@ -248,7 +262,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-The default test suite uses temporary Git repositories and does not require network access. Overlayfs, container, and VM execution are environment-dependent. Overlayfs tests are gated with `KAGE_TEST_OVERLAY=1`; real Docker/Podman/Apple Container execution should be manually verified on the target host.
+The default test suite uses temporary Git repositories and does not require network access. Overlayfs, container, and VM execution are environment-dependent. Overlayfs tests are gated with `KAGE_TEST_OVERLAY=1`; this mode is strict by default and fails if a real overlay mount cannot be performed. Real Docker/Podman/Apple Container execution should be manually verified on the target host.
 
 ## Development notes
 

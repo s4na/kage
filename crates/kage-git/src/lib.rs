@@ -177,6 +177,16 @@ impl GitRepo {
                 ],
             )?;
         }
+        for opaque in read_opaque_dirs(upper)? {
+            validate_rel(&opaque)?;
+            for path in self.tree_paths(parent_commit, &opaque)? {
+                index_run(
+                    &git_dir,
+                    &index,
+                    &["update-index", "--force-remove", path_arg(&path).as_str()],
+                )?;
+            }
+        }
         for entry in walk_files(upper)? {
             let rel = entry.strip_prefix(upper)?.to_path_buf();
             if rel
@@ -188,7 +198,7 @@ impl GitRepo {
             }
             validate_rel(&rel)?;
             let meta = fs::symlink_metadata(&entry)?;
-            if is_overlay_whiteout(&meta) {
+            if is_overlay_whiteout(&entry, &meta) {
                 index_run(
                     &git_dir,
                     &index,
@@ -232,6 +242,23 @@ impl GitRepo {
             .to_string();
         let _ = fs::remove_file(index);
         Ok(tree)
+    }
+
+    fn tree_paths(&self, treeish: &str, prefix: &Path) -> Result<Vec<PathBuf>> {
+        let prefix_arg = path_arg(prefix);
+        let out = output_at(
+            &self.path,
+            "git",
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                treeish,
+                "--",
+                prefix_arg.as_str(),
+            ],
+        )?;
+        Ok(out.lines().map(PathBuf::from).collect())
     }
 
     fn commit_tree_and_update(
@@ -349,8 +376,31 @@ fn hash_bytes(repo: &Path, bytes: &[u8]) -> Result<String> {
     }
 }
 
-fn is_overlay_whiteout(meta: &fs::Metadata) -> bool {
-    meta.file_type().is_char_device() && meta.rdev() == 0
+fn is_overlay_whiteout(path: &Path, meta: &fs::Metadata) -> bool {
+    (meta.file_type().is_char_device() && meta.rdev() == 0)
+        || (meta.is_file()
+            && meta.len() == 0
+            && xattr_value(path, "trusted.overlay.whiteout")
+                .is_some_and(|value| value.trim() == "y"))
+}
+
+fn is_overlay_opaque(path: &Path) -> bool {
+    xattr_value(path, "trusted.overlay.opaque").is_some_and(|value| value.trim() == "y")
+}
+
+fn xattr_value(path: &Path, name: &str) -> Option<String> {
+    let out = Command::new("getfattr")
+        .arg("--only-values")
+        .arg("-n")
+        .arg(name)
+        .arg(path)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
 }
 
 fn read_deletions(upper: &Path) -> Result<Vec<PathBuf>> {
@@ -362,6 +412,25 @@ fn read_deletions(upper: &Path) -> Result<Vec<PathBuf>> {
         .lines()
         .map(PathBuf::from)
         .collect())
+}
+
+fn read_opaque_dirs(upper: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![upper.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = fs::symlink_metadata(&path)?;
+        if !meta.is_dir() {
+            continue;
+        }
+        if path != upper && is_overlay_opaque(&path) {
+            out.push(path.strip_prefix(upper)?.to_path_buf());
+        }
+        for entry in fs::read_dir(path)? {
+            stack.push(entry?.path());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {

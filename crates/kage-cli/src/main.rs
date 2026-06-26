@@ -112,7 +112,7 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
         Some("diff") => {
             let ws = read_workspace(&paths, need(args, 1)?)?;
             let kind = BackendKind::parse(&ws.backend)?;
-            backend_for(kind).refresh_upper_from_merged(&BackendPaths::new(
+            backend_for(kind).sync_before_upper_read(&BackendPaths::new(
                 &ws.lower, &ws.upper, &ws.work, &ws.merged,
             ))?;
             let repo = GitRepo::open(&ws.repo);
@@ -127,7 +127,7 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                 .or_else(|| flag(args, "--message"))
                 .ok_or("missing -m/--message")?;
             let kind = BackendKind::parse(&ws.backend)?;
-            backend_for(kind).refresh_upper_from_merged(&BackendPaths::new(
+            backend_for(kind).sync_before_upper_read(&BackendPaths::new(
                 &ws.lower, &ws.upper, &ws.work, &ws.merged,
             ))?;
             println!(

@@ -37,3 +37,7 @@ Commit-back is intentionally explicit:
 6. Update the ref with old-value protection.
 
 Unsupported stale-workspace strategies such as rebase, merge, or create-new-ref are future work and should be explicit CLI options.
+
+## Overlayfs test semantics
+
+`KAGE_TEST_OVERLAY=1` is strict: a real overlay mount must succeed or the integration test fails. `KAGE_TEST_OVERLAY_ALLOW_SKIP=1` can be used for exploratory local runs to turn mount permission failures into explicit warnings. Xattr-specific whiteout and opaque directory coverage is gated behind `KAGE_TEST_OVERLAY_XATTR=1`.

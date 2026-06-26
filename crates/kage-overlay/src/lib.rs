@@ -64,7 +64,7 @@ pub trait WorkspaceBackend {
     fn kind(&self) -> BackendKind;
     fn mount(&self, paths: &BackendPaths) -> Result<()>;
     fn unmount(&self, paths: &BackendPaths) -> Result<()>;
-    fn refresh_upper_from_merged(&self, paths: &BackendPaths) -> Result<()>;
+    fn sync_before_upper_read(&self, paths: &BackendPaths) -> Result<()>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -80,7 +80,7 @@ impl WorkspaceBackend for DirectoryMergeBackend {
     fn unmount(&self, paths: &BackendPaths) -> Result<()> {
         unmount_directory_merge(&paths.merged)
     }
-    fn refresh_upper_from_merged(&self, paths: &BackendPaths) -> Result<()> {
+    fn sync_before_upper_read(&self, paths: &BackendPaths) -> Result<()> {
         refresh_upper_from_merged(&paths.lower, &paths.merged, &paths.upper)
     }
 }
@@ -98,7 +98,7 @@ impl WorkspaceBackend for LinuxOverlayBackend {
     fn unmount(&self, paths: &BackendPaths) -> Result<()> {
         unmount_linux_overlay(&paths.merged)
     }
-    fn refresh_upper_from_merged(&self, _paths: &BackendPaths) -> Result<()> {
+    fn sync_before_upper_read(&self, _paths: &BackendPaths) -> Result<()> {
         Ok(())
     }
 }
@@ -154,12 +154,13 @@ pub fn mount_linux_overlay(paths: &BackendPaths) -> Result<()> {
     fs::create_dir_all(&paths.upper)?;
     fs::create_dir_all(&paths.work)?;
     fs::create_dir_all(&paths.merged)?;
-    if is_mounted(&paths.merged)? {
-        return Ok(());
+    if let Some(mount) = find_mount(&paths.merged)? {
+        return validate_existing_overlay_mount(paths, &mount);
     }
     ensure_workdir_safe(&paths.work)?;
+    ensure_upper_work_same_filesystem(&paths.upper, &paths.work)?;
     let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
+        "lowerdir={},upperdir={},workdir={},redirect_dir=off",
         paths.lower.display(),
         paths.upper.display(),
         paths.work.display()
@@ -181,11 +182,11 @@ pub fn mount_linux_overlay(paths: &BackendPaths) -> Result<()> {
 
 pub fn unmount_linux_overlay(merged: &Path) -> Result<()> {
     require_linux()?;
-    if !merged.exists() || !is_mounted(merged)? {
+    if !merged.exists() || find_mount(merged)?.is_none() {
         return Ok(());
     }
     let status = Command::new("umount").arg(merged).status()?;
-    if status.success() || !is_mounted(merged)? {
+    if status.success() || find_mount(merged)?.is_none() {
         Ok(())
     } else {
         Err(format!("umount failed with {status}: {}", merged.display()).into())
@@ -259,18 +260,76 @@ fn ensure_workdir_safe(work: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_mounted(path: &Path) -> Result<bool> {
+#[derive(Debug, Clone)]
+struct MountInfo {
+    fstype: String,
+    source: String,
+    super_options: String,
+}
+
+fn find_mount(path: &Path) -> Result<Option<MountInfo>> {
     if !cfg!(target_os = "linux") {
-        return Ok(false);
+        return Ok(None);
     }
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-    Ok(mountinfo.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        fields
-            .nth(4)
-            .is_some_and(|mount_point| Path::new(mount_point) == canonical)
-    }))
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = left.split_whitespace().collect();
+        if fields.len() < 5 || Path::new(fields[4]) != canonical {
+            continue;
+        }
+        let right_fields: Vec<_> = right.split_whitespace().collect();
+        if right_fields.len() < 3 {
+            continue;
+        }
+        return Ok(Some(MountInfo {
+            fstype: right_fields[0].to_string(),
+            source: right_fields[1].to_string(),
+            super_options: right_fields[2..].join(" "),
+        }));
+    }
+    Ok(None)
+}
+
+fn validate_existing_overlay_mount(paths: &BackendPaths, mount: &MountInfo) -> Result<()> {
+    if mount.fstype != "overlay" || mount.source != "overlay" {
+        return Err(format!(
+            "merged path is already mounted by unrelated filesystem: fstype={}, source={}",
+            mount.fstype, mount.source
+        )
+        .into());
+    }
+    for expected in [
+        format!("lowerdir={}", paths.lower.display()),
+        format!("upperdir={}", paths.upper.display()),
+        format!("workdir={}", paths.work.display()),
+    ] {
+        if !mount.super_options.contains(&expected) {
+            return Err(format!(
+                "merged path is mounted as overlay but not for this workspace; missing {expected} in {}",
+                mount.super_options
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_upper_work_same_filesystem(upper: &Path, work: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let upper_dev = fs::metadata(upper)?.dev();
+    let work_dev = fs::metadata(work)?.dev();
+    if upper_dev == work_dev {
+        Ok(())
+    } else {
+        Err(format!(
+            "overlay upperdir and workdir must be on the same filesystem: upper dev={upper_dev}, work dev={work_dev}"
+        )
+        .into())
+    }
 }
 
 fn cleanup_empty_dir(path: &Path) -> Result<()> {
@@ -312,7 +371,7 @@ fn diff_copy(base: &Path, merged: &Path, upper: &Path) -> Result<()> {
         }
         let rel = entry.strip_prefix(merged)?;
         let base_path = base.join(rel);
-        let changed = !base_path.exists() || fs::read(&entry)? != fs::read(&base_path)?;
+        let changed = !base_path.is_file() || fs::read(&entry)? != fs::read(&base_path)?;
         if changed {
             let target = upper.join(rel);
             if let Some(p) = target.parent() {
@@ -405,7 +464,7 @@ mod tests {
         fs::write(p.lower.join("README.md"), "delete me").unwrap();
         fs::write(p.merged.join("src/lib.rs"), "new").unwrap();
         fs::write(p.merged.join("new.txt"), "added").unwrap();
-        DirectoryMergeBackend.refresh_upper_from_merged(&p).unwrap();
+        DirectoryMergeBackend.sync_before_upper_read(&p).unwrap();
         assert_eq!(
             fs::read_to_string(p.upper.join("src/lib.rs")).unwrap(),
             "new"
@@ -479,5 +538,44 @@ mod tests {
             detected.is_ok(),
             "overlayfs should be available when KAGE_TEST_OVERLAY=1: {detected:?}"
         );
+    }
+
+    #[test]
+    fn existing_overlay_mount_must_match_workspace_paths() {
+        let root = temp("mountinfo");
+        let p = paths(&root);
+        let ok = MountInfo {
+            fstype: "overlay".to_string(),
+            source: "overlay".to_string(),
+            super_options: format!(
+                "rw,lowerdir={},upperdir={},workdir={},redirect_dir=off",
+                p.lower.display(),
+                p.upper.display(),
+                p.work.display()
+            ),
+        };
+        assert!(validate_existing_overlay_mount(&p, &ok).is_ok());
+        let unrelated = MountInfo {
+            fstype: "tmpfs".to_string(),
+            source: "tmpfs".to_string(),
+            super_options: "rw".to_string(),
+        };
+        assert!(validate_existing_overlay_mount(&p, &unrelated).is_err());
+        let stale = MountInfo {
+            fstype: "overlay".to_string(),
+            source: "overlay".to_string(),
+            super_options: "rw,lowerdir=/other,upperdir=/other,workdir=/other".to_string(),
+        };
+        assert!(validate_existing_overlay_mount(&p, &stale).is_err());
+    }
+
+    #[test]
+    fn upper_and_work_same_filesystem_validation_accepts_same_temp_root() {
+        let root = temp("samefs");
+        let p = paths(&root);
+        fs::create_dir_all(&p.upper).unwrap();
+        fs::create_dir_all(&p.work).unwrap();
+        assert!(ensure_upper_work_same_filesystem(&p.upper, &p.work).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 }
