@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kage-core", "crates/kage-git", "crates/kage-overlay", "crates/kage-cli", "crates/kage-container"]
+members = ["crates/kage-core", "crates/kage-git", "crates/kage-overlay", "crates/kage-cli", "crates/kage-container", "crates/kage-rofs"]
 resolver = "2"
 
 [workspace.package]

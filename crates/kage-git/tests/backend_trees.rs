@@ -28,9 +28,13 @@ fn setup_repo() -> (PathBuf, GitRepo, String) {
     run_at(&repo_dir, "git", &["config", "user.name", "kage test"]).unwrap();
     fs::write(repo_dir.join("README.md"), "hello").unwrap();
     fs::write(repo_dir.join("delete.txt"), "delete").unwrap();
+    fs::write(repo_dir.join("binary.bin"), [0, 1, 2, 255]).unwrap();
     fs::write(repo_dir.join("rename.txt"), "rename").unwrap();
     fs::create_dir_all(repo_dir.join("dir/sub")).unwrap();
     fs::write(repo_dir.join("dir/sub/file.txt"), "dir file").unwrap();
+    fs::create_dir_all(repo_dir.join("nested")).unwrap();
+    fs::write(repo_dir.join("nested/file with spaces.txt"), "spaces").unwrap();
+    fs::write(repo_dir.join("nested/ユニコード.txt"), "unicode").unwrap();
     fs::write(repo_dir.join("script.sh"), "#!/bin/sh\nexit 0\n").unwrap();
     let mut perms = fs::metadata(repo_dir.join("script.sh"))
         .unwrap()
@@ -233,4 +237,38 @@ fn overlay_xattr_whiteout_and_opaque_directory_when_enabled() {
     );
     fs::remove_dir_all(repo_dir).unwrap();
     fs::remove_dir_all(upper).unwrap();
+}
+
+#[test]
+fn exported_lower_and_git_tree_view_have_equivalent_contents_and_metadata() {
+    let (repo_dir, repo, parent) = setup_repo();
+    let export_root = temp("exported-lower");
+    repo.export_tree(&parent, &export_root).unwrap();
+    let view = kage_rofs::GitTreeView::open(&repo_dir, &parent).unwrap();
+    for path in [
+        "README.md",
+        "binary.bin",
+        "script.sh",
+        "link",
+        "nested/file with spaces.txt",
+        "nested/ユニコード.txt",
+    ] {
+        let meta = view.lookup(Path::new(path)).unwrap();
+        if meta.is_symlink() {
+            assert_eq!(
+                std::fs::read_link(export_root.join(path)).unwrap(),
+                view.read_link(Path::new(path)).unwrap()
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(export_root.join(path)).unwrap(),
+                view.read_file(Path::new(path), 0, usize::MAX).unwrap()
+            );
+        }
+        if path == "script.sh" {
+            assert!(meta.is_executable());
+        }
+    }
+    fs::remove_dir_all(repo_dir).unwrap();
+    fs::remove_dir_all(export_root).unwrap();
 }

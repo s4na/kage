@@ -2,7 +2,8 @@ use kage_container::{
     ensure_workspace_mountable, run as run_container, ContainerRunSpec, ContainerRuntime,
 };
 use kage_core::{
-    list_workspaces, read_workspace, remove_workspace, write_workspace, RuntimePaths, WorkspaceSpec,
+    list_workspaces, read_workspace, remove_workspace, write_workspace, LowerKind, RuntimePaths,
+    WorkspaceSpec,
 };
 use kage_git::GitRepo;
 use kage_overlay::{backend_for, BackendKind, BackendPaths};
@@ -68,6 +69,11 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                     .or_else(|| env::var("KAGE_BACKEND").ok())
                     .unwrap_or_else(|| "fallback".to_string()),
             )?;
+            let lower_kind = LowerKind::parse(
+                &flag(args, "--lower")
+                    .or_else(|| env::var("KAGE_LOWER").ok())
+                    .unwrap_or_else(|| "exported".to_string()),
+            )?;
             let repo_path =
                 PathBuf::from(flag(args, "--repo").unwrap_or_else(|| ".".into())).canonicalize()?;
             let repo = GitRepo::open(repo_path);
@@ -84,8 +90,15 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                 work: root.join("work"),
                 merged: root.join("merged"),
                 backend: backend_kind.as_str().to_string(),
+                lower_kind: lower_kind.as_str().to_string(),
             };
-            repo.export_tree(&ws.parent_commit, &ws.lower)?;
+            match lower_kind {
+                LowerKind::Exported => repo.export_tree(&ws.parent_commit, &ws.lower)?,
+                LowerKind::GitRofs => {
+                    let _view = kage_rofs::GitTreeView::open(&ws.repo, &ws.parent_commit)?;
+                    return Err("git-rofs lower model is available, but rofs filesystem mount is not implemented yet; use --lower exported for workspace mounts".into());
+                }
+            }
             std::fs::create_dir_all(&ws.upper)?;
             std::fs::create_dir_all(&ws.work)?;
             let backend_paths = BackendPaths::new(&ws.lower, &ws.upper, &ws.work, &ws.merged);

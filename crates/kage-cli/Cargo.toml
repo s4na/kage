@@ -15,3 +15,4 @@ kage-core = { path = "../kage-core" }
 kage-git = { path = "../kage-git" }
 kage-overlay = { path = "../kage-overlay" }
 kage-container = { path = "../kage-container" }
+kage-rofs = { path = "../kage-rofs" }

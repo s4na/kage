@@ -5,6 +5,28 @@ use std::{
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LowerKind {
+    Exported,
+    GitRofs,
+}
+
+impl LowerKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "exported" | "archive" => Ok(Self::Exported),
+            "git-rofs" | "rofs" => Ok(Self::GitRofs),
+            other => Err(format!("unsupported lower source: {other}").into()),
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exported => "exported",
+            Self::GitRofs => "git-rofs",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSpec {
     pub id: String,
     pub repo: PathBuf,
@@ -15,6 +37,7 @@ pub struct WorkspaceSpec {
     pub work: PathBuf,
     pub merged: PathBuf,
     pub backend: String,
+    pub lower_kind: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationKind {
@@ -102,7 +125,7 @@ pub fn write_workspace(paths: &RuntimePaths, ws: &WorkspaceSpec) -> Result<()> {
     validate_workspace_id(&ws.id)?;
     fs::create_dir_all(paths.workspace_dir(&ws.id))?;
     let data = format!(
-        "id\t{}\nrepo\t{}\nreference\t{}\nparent\t{}\nlower\t{}\nupper\t{}\nwork\t{}\nmerged\t{}\nbackend\t{}\n",
+        "id\t{}\nrepo\t{}\nreference\t{}\nparent\t{}\nlower\t{}\nupper\t{}\nwork\t{}\nmerged\t{}\nbackend\t{}\nlower_kind\t{}\n",
         ws.id,
         ws.repo.display(),
         ws.reference,
@@ -111,7 +134,8 @@ pub fn write_workspace(paths: &RuntimePaths, ws: &WorkspaceSpec) -> Result<()> {
         ws.upper.display(),
         ws.work.display(),
         ws.merged.display(),
-        ws.backend
+        ws.backend,
+        ws.lower_kind
     );
     fs::write(paths.metadata_path(&ws.id), data)?;
     Ok(())
@@ -138,6 +162,10 @@ pub fn read_workspace(paths: &RuntimePaths, id: &str) -> Result<WorkspaceSpec> {
             .get("backend")
             .cloned()
             .unwrap_or_else(|| "fallback".to_string()),
+        lower_kind: m
+            .get("lower_kind")
+            .cloned()
+            .unwrap_or_else(|| "exported".to_string()),
     })
 }
 pub fn list_workspaces(paths: &RuntimePaths) -> Result<Vec<WorkspaceSpec>> {
@@ -198,6 +226,7 @@ mod tests {
             work: PathBuf::from("/kage/work"),
             merged: PathBuf::from("/kage/merged"),
             backend: "fallback".to_string(),
+            lower_kind: "exported".to_string(),
         };
 
         write_workspace(&paths, &ws).unwrap();
@@ -214,6 +243,13 @@ mod tests {
         assert!(validate_workspace_id("agent_42-main").is_ok());
         assert!(validate_workspace_id("../escape").is_err());
         assert!(validate_workspace_id("").is_err());
+    }
+
+    #[test]
+    fn lower_kind_parses_supported_values() {
+        assert_eq!(LowerKind::parse("exported").unwrap(), LowerKind::Exported);
+        assert_eq!(LowerKind::parse("git-rofs").unwrap(), LowerKind::GitRofs);
+        assert!(LowerKind::parse("unknown").is_err());
     }
 
     #[test]

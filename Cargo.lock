@@ -10,6 +10,7 @@ dependencies = [
  "kage-core",
  "kage-git",
  "kage-overlay",
+ "kage-rofs",
 ]
 
 [[package]]
@@ -25,8 +26,16 @@ name = "kage-git"
 version = "0.1.0"
 dependencies = [
  "kage-overlay",
+ "kage-rofs",
 ]
 
 [[package]]
 name = "kage-overlay"
 version = "0.1.0"
+
+[[package]]
+name = "kage-rofs"
+version = "0.1.0"
+dependencies = [
+ "kage-core",
+]

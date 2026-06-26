@@ -174,3 +174,55 @@ fn two_workspaces_from_same_ref_have_isolated_layers_and_conflict_on_second_comm
     fs::remove_dir_all(repo).unwrap();
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn workspace_create_records_exported_lower_and_rejects_git_rofs_mount_until_fuse_exists() {
+    let repo = setup_repo();
+    let home = temp("home");
+    let out = kage(
+        &home,
+        &[
+            "workspace",
+            "create",
+            "--ref",
+            "main",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--id",
+            "ws_exported",
+            "--lower",
+            "exported",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "exported lower create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let metadata = fs::read_to_string(home.join("workspaces/ws_exported/workspace.tsv")).unwrap();
+    assert!(metadata.contains("lower_kind\texported"));
+
+    let out = kage(
+        &home,
+        &[
+            "workspace",
+            "create",
+            "--ref",
+            "main",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--id",
+            "ws_rofs",
+            "--lower",
+            "git-rofs",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "git-rofs workspace mount should currently fail clearly"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("rofs filesystem mount is not implemented yet"));
+    fs::remove_dir_all(repo).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}

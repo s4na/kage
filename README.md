@@ -31,13 +31,14 @@ IDE / Container / AI Agent / Test Runner
 
 Current implementation status:
 
-- `kage-core`: workspace metadata, runtime paths, path validation, and the read-only `BaseLayer` trait boundary.
-- `kage-git`: Git CLI backed object/ref adapter. Commit-back now applies the workspace upper layer to the parent tree through a temporary Git index instead of scanning a normal Git worktree.
+- `kage-core`: workspace metadata, runtime paths, path validation, lower-kind metadata, and the read-only `BaseLayer` trait boundary.
+- `kage-rofs`: lazy read-only Git tree model. It resolves refs/commits and reads tree entries/blobs/symlinks directly through Git plumbing without checkout/archive/export. It does not yet provide a FUSE mount.
+- `kage-git`: Git CLI backed object/ref adapter. Commit-back applies the workspace upper layer to the parent tree through a temporary Git index instead of scanning a normal Git worktree.
 - `kage-overlay`: backend trait plus two implemented backends: non-privileged `fallback` directory-merge for debug/tests, and opt-in `overlayfs` for native Linux overlay mounts.
 - `kage-container`: container argv construction for Docker, Podman, and Apple Container.
 - `kage-cli`: CLI for repository/workspace lifecycle, diff, commit, local exec, and container exec.
 
-The fallback backend still exports a Git tree into an internal lower directory to provide a plain editable `merged` directory in unprivileged environments. That fallback is development/debug infrastructure. The first production-like backend boundary is `overlayfs`, which runs a native Linux overlay mount over lower/upper/work/merged directories when explicitly selected. The remaining production gap is replacing the exported lower directory with a lazy read-only Git tree view inside the managed Linux runtime.
+The fallback backend still exports a Git tree into an internal lower directory to provide a plain editable `merged` directory in unprivileged environments. That fallback is development/debug infrastructure. The first production-like backend boundary is `overlayfs`, which runs a native Linux overlay mount over lower/upper/work/merged directories when explicitly selected. `kage-rofs` now provides the lazy Git tree view/model, but the actual read-only FUSE mount that would let overlayfs use it as `lowerdir` is not implemented yet.
 
 ## Apple Silicon / arm64 Linux v1 target
 
@@ -95,7 +96,7 @@ Build kage and create a workspace:
 
 ```bash
 cargo build --workspace
-./target/debug/kage --home /tmp/kage-home workspace create --ref main --repo /tmp/kage-demo --id ws-main --backend fallback
+./target/debug/kage --home /tmp/kage-home workspace create --ref main --repo /tmp/kage-demo --id ws-main --backend fallback --lower exported
 ```
 
 Edit the fallback merged view:
@@ -121,7 +122,7 @@ Discard workspace state:
 ## Workspace lifecycle
 
 ```bash
-kage --home .kage workspace create --ref main --repo . --id ws-main --backend fallback
+kage --home .kage workspace create --ref main --repo . --id ws-main --backend fallback --lower exported
 kage --home .kage workspace list
 kage --home .kage workspace mount ws-main
 kage --home .kage workspace diff ws-main
@@ -192,20 +193,25 @@ The current implementation constructs the container command and bind-mounts the 
 
 ## Backends
 
-`kage-overlay` exposes a `WorkspaceBackend` trait with these implemented choices:
+`kage-overlay` exposes a `WorkspaceBackend` trait with these implemented choices. Workspace creation also accepts a lower source via `--lower` or `KAGE_LOWER`:
 
 - `fallback`: directory-merge fallback for unprivileged development and tests. It may materialize the selected tree into `lower/`, so it is not the production checkout-less backend. It stores deletions in `upper/.kage/deleted`.
 - `overlayfs`: native Linux overlayfs backend. It validates distinct lower/upper/work/merged directories, requires an empty workdir, runs `mount -t overlay overlay -o lowerdir=<lower>,upperdir=<upper>,workdir=<work> <merged>`, and unmounts idempotently. It is opt-in with `--backend overlayfs` or `KAGE_BACKEND=overlayfs`.
+- `--lower exported`: default lower source. It uses the exported lower fallback and is the only lower that can currently be mounted.
+- `--lower git-rofs`: lazy Git tree model. It can read Git tree contents without checkout/export, but workspace mounting with it is rejected until the read-only FUSE mount is implemented.
 
 Example:
 
 ```bash
-kage --home .kage workspace create --ref main --repo . --id ws-main --backend overlayfs
+kage --home .kage workspace create --ref main --repo . --id ws-main --backend overlayfs --lower exported
 # or
-KAGE_BACKEND=overlayfs kage --home .kage workspace create --ref main --repo . --id ws-main
+KAGE_BACKEND=overlayfs KAGE_LOWER=exported kage --home .kage workspace create --ref main --repo . --id ws-main
+
+# GitTreeView-only lower model; currently fails for workspace mount until rofs FUSE exists:
+kage --home .kage workspace create --ref main --repo . --id ws-rofs --backend overlayfs --lower git-rofs
 ```
 
-Overlayfs requires Linux, overlayfs support, and enough privilege/capability to mount overlay filesystems, typically root or `CAP_SYS_ADMIN`. In the current prototype, both fallback and overlayfs still use the exported `lower/` directory; the lazy Git read-only lower filesystem is future work.
+Overlayfs requires Linux, overlayfs support, and enough privilege/capability to mount overlay filesystems, typically root or `CAP_SYS_ADMIN`. In the current prototype, mounted workspaces still require `--lower exported`; `--lower git-rofs` is available as a lazy read-only Git tree model but not yet as a filesystem `lowerdir`.
 
 Both backends:
 
@@ -214,28 +220,34 @@ Both backends:
 
 Not yet implemented:
 
+- read-only rofs FUSE mount;
+- rofs + overlayfs strict integration;
 - rootless fuse-overlayfs mount orchestration;
 - daemonized mount supervision;
 - Apple Container VM provisioning/health checks;
 - concurrent registry locking beyond per-workspace directory isolation;
 - rebase/merge/create-ref strategy for stale workspaces.
 
-Environment-gated overlay tests:
+Environment-gated rofs and overlay tests:
 
 ```bash
+KAGE_TEST_ROFS=1 cargo test -p kage-rofs rofs_mount_strict_fails_until_fuse_mount_is_implemented -- --nocapture
 KAGE_TEST_OVERLAY=1 cargo test -p kage-overlay overlayfs_detection_is_explicitly_environment_dependent -- --nocapture
 KAGE_TEST_OVERLAY=1 cargo test -p kage-git overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --nocapture
+KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture
 ```
 
 With `KAGE_TEST_OVERLAY=1`, the overlay integration test requires a real overlay mount and fails if the host lacks mount capability. For exploratory local runs where a permission-related skip is acceptable, set `KAGE_TEST_OVERLAY_ALLOW_SKIP=1`; the test prints an explicit warning before skipping the mount body. A real validation run should be performed on a Linux host or managed Linux VM with overlayfs mount capability.
 
-A manual privileged verification helper is available:
+Manual verification helpers are available:
 
 ```bash
+scripts/verify-rofs.sh
 scripts/verify-overlayfs.sh
+scripts/verify-rofs-overlay.sh
 ```
 
-It prints kernel, identity, overlay availability, tempdir filesystem details, a direct mount probe, and then runs `KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture`.
+They print kernel/OS/architecture, identity, `/dev/fuse`, overlay availability, tempdir filesystem details, direct mount probes where applicable, and strict gated cargo test commands.
 
 Xattr-based whiteout and opaque directory detection can be tested on filesystems that allow `trusted.overlay.*` xattrs and have `setfattr` installed:
 
@@ -262,7 +274,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-The default test suite uses temporary Git repositories and does not require network access. Overlayfs, container, and VM execution are environment-dependent. Overlayfs tests are gated with `KAGE_TEST_OVERLAY=1`; this mode is strict by default and fails if a real overlay mount cannot be performed. Real Docker/Podman/Apple Container execution should be manually verified on the target host.
+The default test suite uses temporary Git repositories and does not require network access. Pure `GitTreeView` tests run by default. Rofs mount, overlayfs, container, and VM execution are environment-dependent. `KAGE_TEST_ROFS=1` and `KAGE_TEST_OVERLAY=1` are strict by default and fail if real mounts cannot be performed. Real Docker/Podman/Apple Container execution should be manually verified on the target host.
 
 ## Development notes
 
