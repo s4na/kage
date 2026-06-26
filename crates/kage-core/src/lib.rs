@@ -14,6 +14,7 @@ pub struct WorkspaceSpec {
     pub upper: PathBuf,
     pub work: PathBuf,
     pub merged: PathBuf,
+    pub backend: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationKind {
@@ -101,7 +102,7 @@ pub fn write_workspace(paths: &RuntimePaths, ws: &WorkspaceSpec) -> Result<()> {
     validate_workspace_id(&ws.id)?;
     fs::create_dir_all(paths.workspace_dir(&ws.id))?;
     let data = format!(
-        "id\t{}\nrepo\t{}\nreference\t{}\nparent\t{}\nlower\t{}\nupper\t{}\nwork\t{}\nmerged\t{}\n",
+        "id\t{}\nrepo\t{}\nreference\t{}\nparent\t{}\nlower\t{}\nupper\t{}\nwork\t{}\nmerged\t{}\nbackend\t{}\n",
         ws.id,
         ws.repo.display(),
         ws.reference,
@@ -109,7 +110,8 @@ pub fn write_workspace(paths: &RuntimePaths, ws: &WorkspaceSpec) -> Result<()> {
         ws.lower.display(),
         ws.upper.display(),
         ws.work.display(),
-        ws.merged.display()
+        ws.merged.display(),
+        ws.backend
     );
     fs::write(paths.metadata_path(&ws.id), data)?;
     Ok(())
@@ -132,6 +134,10 @@ pub fn read_workspace(paths: &RuntimePaths, id: &str) -> Result<WorkspaceSpec> {
         upper: m["upper"].clone().into(),
         work: m["work"].clone().into(),
         merged: m["merged"].clone().into(),
+        backend: m
+            .get("backend")
+            .cloned()
+            .unwrap_or_else(|| "fallback".to_string()),
     })
 }
 pub fn list_workspaces(paths: &RuntimePaths) -> Result<Vec<WorkspaceSpec>> {
@@ -191,6 +197,7 @@ mod tests {
             upper: PathBuf::from("/kage/upper"),
             work: PathBuf::from("/kage/work"),
             merged: PathBuf::from("/kage/merged"),
+            backend: "fallback".to_string(),
         };
 
         write_workspace(&paths, &ws).unwrap();

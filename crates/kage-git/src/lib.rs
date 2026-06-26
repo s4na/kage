@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -188,6 +188,14 @@ impl GitRepo {
             }
             validate_rel(&rel)?;
             let meta = fs::symlink_metadata(&entry)?;
+            if is_overlay_whiteout(&meta) {
+                index_run(
+                    &git_dir,
+                    &index,
+                    &["update-index", "--force-remove", path_arg(&rel).as_str()],
+                )?;
+                continue;
+            }
             let (mode, oid) = if meta.file_type().is_symlink() {
                 (
                     "120000",
@@ -339,6 +347,10 @@ fn hash_bytes(repo: &Path, bytes: &[u8]) -> Result<String> {
         )
         .into())
     }
+}
+
+fn is_overlay_whiteout(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_char_device() && meta.rdev() == 0
 }
 
 fn read_deletions(upper: &Path) -> Result<Vec<PathBuf>> {

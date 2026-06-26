@@ -23,6 +23,9 @@ version = "0.1.0"
 [[package]]
 name = "kage-git"
 version = "0.1.0"
+dependencies = [
+ "kage-overlay",
+]
 
 [[package]]
 name = "kage-overlay"

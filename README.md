@@ -33,11 +33,11 @@ Current implementation status:
 
 - `kage-core`: workspace metadata, runtime paths, path validation, and the read-only `BaseLayer` trait boundary.
 - `kage-git`: Git CLI backed object/ref adapter. Commit-back now applies the workspace upper layer to the parent tree through a temporary Git index instead of scanning a normal Git worktree.
-- `kage-overlay`: non-privileged directory-merge fallback for local development and tests. It is **not** the primary production backend and may materialize a fallback lower directory.
+- `kage-overlay`: backend trait plus two implemented backends: non-privileged `fallback` directory-merge for debug/tests, and opt-in `overlayfs` for native Linux overlay mounts.
 - `kage-container`: container argv construction for Docker, Podman, and Apple Container.
 - `kage-cli`: CLI for repository/workspace lifecycle, diff, commit, local exec, and container exec.
 
-The current fallback backend still exports a Git tree into an internal lower directory to provide a plain editable `merged` directory in unprivileged environments. That fallback is intentionally documented as development/debug infrastructure. The production architecture boundary is the parent-tree + upper-layer mutation model in `kage-git`, plus future Linux overlayfs/fuse-overlayfs backends.
+The fallback backend still exports a Git tree into an internal lower directory to provide a plain editable `merged` directory in unprivileged environments. That fallback is development/debug infrastructure. The first production-like backend boundary is `overlayfs`, which runs a native Linux overlay mount over lower/upper/work/merged directories when explicitly selected. The remaining production gap is replacing the exported lower directory with a lazy read-only Git tree view inside the managed Linux runtime.
 
 ## Apple Silicon / arm64 Linux v1 target
 
@@ -95,7 +95,7 @@ Build kage and create a workspace:
 
 ```bash
 cargo build --workspace
-./target/debug/kage --home /tmp/kage-home workspace create --ref main --repo /tmp/kage-demo --id ws-main
+./target/debug/kage --home /tmp/kage-home workspace create --ref main --repo /tmp/kage-demo --id ws-main --backend fallback
 ```
 
 Edit the fallback merged view:
@@ -121,7 +121,7 @@ Discard workspace state:
 ## Workspace lifecycle
 
 ```bash
-kage --home .kage workspace create --ref main --repo . --id ws-main
+kage --home .kage workspace create --ref main --repo . --id ws-main --backend fallback
 kage --home .kage workspace list
 kage --home .kage workspace mount ws-main
 kage --home .kage workspace diff ws-main
@@ -190,30 +190,44 @@ kage --home .kage run ws-main --apple-container --image rust:latest -- cargo tes
 
 The current implementation constructs the container command and bind-mounts the prepared workspace at `/workspace`. It does not yet provision or verify the Apple managed Linux VM by itself. Manual Apple Container verification requires Apple Silicon macOS with the `container` CLI installed.
 
-## Backend limitations
+## Backends
 
-Current default backend:
+`kage-overlay` exposes a `WorkspaceBackend` trait with these implemented choices:
 
-- uses a directory-merge fallback for unprivileged development and tests;
-- may materialize the selected tree into `lower/`, so it is not the production checkout-less backend;
-- stores deletions in `upper/.kage/deleted`;
-- represents rename as delete + add;
-- intentionally ignores empty directories because Git trees do not store them.
+- `fallback`: directory-merge fallback for unprivileged development and tests. It may materialize the selected tree into `lower/`, so it is not the production checkout-less backend. It stores deletions in `upper/.kage/deleted`.
+- `overlayfs`: native Linux overlayfs backend. It validates distinct lower/upper/work/merged directories, requires an empty workdir, runs `mount -t overlay overlay -o lowerdir=<lower>,upperdir=<upper>,workdir=<work> <merged>`, and unmounts idempotently. It is opt-in with `--backend overlayfs` or `KAGE_BACKEND=overlayfs`.
+
+Example:
+
+```bash
+kage --home .kage workspace create --ref main --repo . --id ws-main --backend overlayfs
+# or
+KAGE_BACKEND=overlayfs kage --home .kage workspace create --ref main --repo . --id ws-main
+```
+
+Overlayfs requires Linux, overlayfs support, and enough privilege/capability to mount overlay filesystems, typically root or `CAP_SYS_ADMIN`. In the current prototype, both fallback and overlayfs still use the exported `lower/` directory; the lazy Git read-only lower filesystem is future work.
+
+Both backends:
+
+- represent rename as delete + add;
+- intentionally ignore empty directories because Git trees do not store them.
 
 Not yet implemented:
 
-- native Linux overlayfs mount orchestration;
 - rootless fuse-overlayfs mount orchestration;
 - daemonized mount supervision;
 - Apple Container VM provisioning/health checks;
 - concurrent registry locking beyond per-workspace directory isolation;
 - rebase/merge/create-ref strategy for stale workspaces.
 
-Environment-gated overlay detection test:
+Environment-gated overlay tests:
 
 ```bash
-KAGE_TEST_OVERLAY=1 cargo test -p kage-overlay overlayfs_detection_is_explicitly_environment_dependent
+KAGE_TEST_OVERLAY=1 cargo test -p kage-overlay overlayfs_detection_is_explicitly_environment_dependent -- --nocapture
+KAGE_TEST_OVERLAY=1 cargo test -p kage-git overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --nocapture
 ```
+
+If the host lacks overlay mount privilege, the integration body reports the mount error and exits without verifying the full overlay behavior. A real validation run should be performed on a Linux host or managed Linux VM with overlayfs mount capability.
 
 ## Safety model
 
@@ -234,7 +248,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-The default test suite uses temporary Git repositories and does not require network access. Container/VM execution is represented by command construction tests; real Docker/Podman/Apple Container execution is environment-dependent and should be manually verified on the target host.
+The default test suite uses temporary Git repositories and does not require network access. Overlayfs, container, and VM execution are environment-dependent. Overlayfs tests are gated with `KAGE_TEST_OVERLAY=1`; real Docker/Podman/Apple Container execution should be manually verified on the target host.
 
 ## Development notes
 

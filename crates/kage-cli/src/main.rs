@@ -5,6 +5,7 @@ use kage_core::{
     list_workspaces, read_workspace, remove_workspace, write_workspace, RuntimePaths, WorkspaceSpec,
 };
 use kage_git::GitRepo;
+use kage_overlay::{backend_for, BackendKind, BackendPaths};
 use std::{env, path::PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -62,6 +63,11 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                 .or_else(|| flag(args, "--ref"))
                 .unwrap_or_else(|| "HEAD".into());
             let id = flag(args, "--id");
+            let backend_kind = BackendKind::parse(
+                &flag(args, "--backend")
+                    .or_else(|| env::var("KAGE_BACKEND").ok())
+                    .unwrap_or_else(|| "fallback".to_string()),
+            )?;
             let repo_path =
                 PathBuf::from(flag(args, "--repo").unwrap_or_else(|| ".".into())).canonicalize()?;
             let repo = GitRepo::open(repo_path);
@@ -77,11 +83,13 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                 upper: root.join("upper"),
                 work: root.join("work"),
                 merged: root.join("merged"),
+                backend: backend_kind.as_str().to_string(),
             };
             repo.export_tree(&ws.parent_commit, &ws.lower)?;
             std::fs::create_dir_all(&ws.upper)?;
             std::fs::create_dir_all(&ws.work)?;
-            kage_overlay::mount_directory_merge(&ws.lower, &ws.upper, &ws.merged)?;
+            let backend_paths = BackendPaths::new(&ws.lower, &ws.upper, &ws.work, &ws.merged);
+            backend_for(backend_kind).mount(&backend_paths)?;
             write_workspace(&paths, &ws)?;
             println!("{} {}", ws.id, ws.merged.display());
             Ok(())
@@ -94,13 +102,19 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
         }
         Some("mount") => {
             let ws = read_workspace(&paths, need(args, 1)?)?;
-            kage_overlay::mount_directory_merge(&ws.lower, &ws.upper, &ws.merged)?;
+            let kind = BackendKind::parse(&ws.backend)?;
+            backend_for(kind).mount(&BackendPaths::new(
+                &ws.lower, &ws.upper, &ws.work, &ws.merged,
+            ))?;
             println!("{}", ws.merged.display());
             Ok(())
         }
         Some("diff") => {
             let ws = read_workspace(&paths, need(args, 1)?)?;
-            kage_overlay::refresh_upper_from_merged(&ws.lower, &ws.merged, &ws.upper)?;
+            let kind = BackendKind::parse(&ws.backend)?;
+            backend_for(kind).refresh_upper_from_merged(&BackendPaths::new(
+                &ws.lower, &ws.upper, &ws.work, &ws.merged,
+            ))?;
             let repo = GitRepo::open(&ws.repo);
             for entry in repo.layer_diff_name_status(&ws.parent_commit, &ws.upper)? {
                 println!("{}\t{}", entry.status, entry.path.display());
@@ -112,7 +126,10 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
             let msg = flag(args, "-m")
                 .or_else(|| flag(args, "--message"))
                 .ok_or("missing -m/--message")?;
-            kage_overlay::refresh_upper_from_merged(&ws.lower, &ws.merged, &ws.upper)?;
+            let kind = BackendKind::parse(&ws.backend)?;
+            backend_for(kind).refresh_upper_from_merged(&BackendPaths::new(
+                &ws.lower, &ws.upper, &ws.work, &ws.merged,
+            ))?;
             println!(
                 "{}",
                 GitRepo::open(&ws.repo).commit_from_layer(
@@ -124,7 +141,16 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
             );
             Ok(())
         }
-        Some("discard") => remove_workspace(&paths, need(args, 1)?),
+        Some("discard") => {
+            let id = need(args, 1)?;
+            if let Ok(ws) = read_workspace(&paths, id) {
+                let kind = BackendKind::parse(&ws.backend)?;
+                backend_for(kind).unmount(&BackendPaths::new(
+                    &ws.lower, &ws.upper, &ws.work, &ws.merged,
+                ))?;
+            }
+            remove_workspace(&paths, id)
+        }
         Some("gc") => {
             println!("gc complete");
             Ok(())
