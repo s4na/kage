@@ -181,6 +181,79 @@ fn overlayfs_backend_tree_matches_fallback_tree_when_enabled() {
 }
 
 #[test]
+fn rofs_overlay_backend_tree_matches_fallback_tree_when_enabled() {
+    if std::env::var_os("KAGE_TEST_ROFS").is_none()
+        || std::env::var_os("KAGE_TEST_OVERLAY").is_none()
+        || !cfg!(target_os = "linux")
+    {
+        eprintln!("skipping rofs+overlay integration test; set KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 on Linux with /dev/fuse and overlay mount privileges");
+        return;
+    }
+    let (repo_dir, repo, parent) = setup_repo();
+    let fallback_root = temp("fallback");
+    let expected = fallback_tree(&repo, &parent, &fallback_root);
+    let root = temp("rofs-overlay");
+    let paths = BackendPaths::new(
+        root.join("lower"),
+        root.join("upper"),
+        root.join("work"),
+        root.join("merged"),
+    );
+    fs::create_dir_all(&paths.lower).unwrap();
+    let view = kage_rofs::GitTreeView::open(&repo_dir, &parent).unwrap();
+    let rofs = match kage_rofs::mount_rofs_strict(&view, &paths.lower) {
+        Ok(handle) => handle,
+        Err(err) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
+            eprintln!(
+                "WARNING: skipping rofs+overlay body because rofs mount is unavailable: {err}"
+            );
+            let _ = fs::remove_dir_all(repo_dir);
+            let _ = fs::remove_dir_all(fallback_root);
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        Err(err) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
+    };
+    if let Err(err) = LinuxOverlayBackend.mount(&paths) {
+        let _ = rofs.unmount();
+        let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(fallback_root);
+        let _ = fs::remove_dir_all(root);
+        if std::env::var_os("KAGE_TEST_OVERLAY_ALLOW_SKIP").is_some() {
+            eprintln!(
+                "WARNING: skipping rofs+overlay body because overlay mount is unavailable: {err}"
+            );
+            return;
+        }
+        panic!("KAGE_TEST_OVERLAY=1 requires a real overlay mount: {err}");
+    }
+    assert_eq!(
+        fs::read_to_string(paths.merged.join("README.md")).unwrap(),
+        "hello"
+    );
+    assert_eq!(
+        fs::read(paths.merged.join("binary.bin")).unwrap(),
+        vec![0, 1, 2, 255]
+    );
+    assert_eq!(
+        fs::read_link(paths.merged.join("link")).unwrap(),
+        PathBuf::from("README.md")
+    );
+    apply_edits(&paths.merged);
+    assert_eq!(
+        fs::read_to_string(paths.upper.join("README.md")).unwrap(),
+        "modified"
+    );
+    LinuxOverlayBackend.unmount(&paths).unwrap();
+    let actual = repo.tree_from_layer(&parent, &paths.upper).unwrap();
+    assert_eq!(actual, expected);
+    rofs.unmount().unwrap();
+    fs::remove_dir_all(repo_dir).unwrap();
+    fs::remove_dir_all(fallback_root).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn overlay_xattr_whiteout_and_opaque_directory_when_enabled() {
     if std::env::var_os("KAGE_TEST_OVERLAY_XATTR").is_none() {
         eprintln!("skipping xattr whiteout/opaque test; set KAGE_TEST_OVERLAY_XATTR=1 on a filesystem that permits trusted.overlay.* xattrs");

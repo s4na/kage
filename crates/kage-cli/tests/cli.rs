@@ -176,7 +176,7 @@ fn two_workspaces_from_same_ref_have_isolated_layers_and_conflict_on_second_comm
 }
 
 #[test]
-fn workspace_create_records_exported_lower_and_rejects_git_rofs_mount_until_fuse_exists() {
+fn workspace_create_records_exported_lower_and_rejects_git_rofs_with_fallback_backend() {
     let repo = setup_repo();
     let home = temp("home");
     let out = kage(
@@ -222,7 +222,7 @@ fn workspace_create_records_exported_lower_and_rejects_git_rofs_mount_until_fuse
         "git-rofs workspace mount should currently fail clearly"
     );
     assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("rofs filesystem mount is not implemented yet"));
+        .contains("--lower git-rofs currently requires --backend overlayfs"));
     fs::remove_dir_all(repo).unwrap();
     fs::remove_dir_all(home).unwrap();
 }

@@ -7,7 +7,13 @@ use kage_core::{
 };
 use kage_git::GitRepo;
 use kage_overlay::{backend_for, BackendKind, BackendPaths};
-use std::{env, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> Result<()> {
@@ -28,6 +34,7 @@ fn main() -> Result<()> {
         Some("workspace") => workspace(paths, &args[1..]),
         Some("exec") => exec(paths, &args[1..]),
         Some("run") => run_workspace_container(paths, &args[1..]),
+        Some("rofs-serve") => rofs_serve(&args[1..]),
         _ => {
             eprintln!("usage: kage [--home DIR] <repo|workspace|exec|run> ...");
             Ok(())
@@ -95,14 +102,19 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
             match lower_kind {
                 LowerKind::Exported => repo.export_tree(&ws.parent_commit, &ws.lower)?,
                 LowerKind::GitRofs => {
-                    let _view = kage_rofs::GitTreeView::open(&ws.repo, &ws.parent_commit)?;
-                    return Err("git-rofs lower model is available, but rofs filesystem mount is not implemented yet; use --lower exported for workspace mounts".into());
+                    if backend_kind != BackendKind::OverlayFs {
+                        return Err("--lower git-rofs currently requires --backend overlayfs because the fallback backend needs an exported lower directory".into());
+                    }
+                    start_rofs_daemon(&ws)?;
                 }
             }
             std::fs::create_dir_all(&ws.upper)?;
             std::fs::create_dir_all(&ws.work)?;
             let backend_paths = BackendPaths::new(&ws.lower, &ws.upper, &ws.work, &ws.merged);
-            backend_for(backend_kind).mount(&backend_paths)?;
+            if let Err(err) = backend_for(backend_kind).mount(&backend_paths) {
+                let _ = stop_rofs_daemon(&root);
+                return Err(err);
+            }
             write_workspace(&paths, &ws)?;
             println!("{} {}", ws.id, ws.merged.display());
             Ok(())
@@ -161,6 +173,7 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
                 backend_for(kind).unmount(&BackendPaths::new(
                     &ws.lower, &ws.upper, &ws.work, &ws.merged,
                 ))?;
+                let _ = stop_rofs_daemon(&paths.workspace_dir(id));
             }
             remove_workspace(&paths, id)
         }
@@ -171,6 +184,77 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
         _ => Err("usage: kage workspace <create|list|mount|diff|commit|discard|gc>".into()),
     }
 }
+fn rofs_serve(args: &[String]) -> Result<()> {
+    let repo = PathBuf::from(flag(args, "--repo").ok_or("missing --repo")?);
+    let reference = flag(args, "--ref").ok_or("missing --ref")?;
+    let mountpoint = PathBuf::from(flag(args, "--mountpoint").ok_or("missing --mountpoint")?);
+    let view = kage_rofs::GitTreeView::open(repo, &reference)?;
+    let _mount = kage_rofs::mount_rofs_strict(&view, &mountpoint)?;
+    loop {
+        thread::park_timeout(Duration::from_secs(3600));
+    }
+}
+
+fn start_rofs_daemon(ws: &WorkspaceSpec) -> Result<()> {
+    fs::create_dir_all(&ws.lower)?;
+    let exe = env::current_exe()?;
+    let root = ws
+        .lower
+        .parent()
+        .ok_or("workspace lower path has no parent directory")?;
+    let pid_path = root.join("rofs.pid");
+    let err_path = root.join("rofs.stderr");
+    let err = fs::File::create(&err_path)?;
+    let mut child = Command::new(exe)
+        .arg("rofs-serve")
+        .arg("--repo")
+        .arg(&ws.repo)
+        .arg("--ref")
+        .arg(&ws.parent_commit)
+        .arg("--mountpoint")
+        .arg(&ws.lower)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err))
+        .spawn()?;
+    fs::write(&pid_path, child.id().to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            let stderr = fs::read_to_string(&err_path).unwrap_or_default();
+            let _ = fs::remove_file(&pid_path);
+            return Err(
+                format!("kage-rofs daemon exited during mount with {status}: {stderr}").into(),
+            );
+        }
+        if rofs_mount_ready(&ws.lower) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&pid_path);
+    Err("timed out waiting for kage-rofs mount to become readable".into())
+}
+
+fn rofs_mount_ready(mountpoint: &Path) -> bool {
+    fs::read_dir(mountpoint).is_ok()
+}
+
+fn stop_rofs_daemon(root: &Path) -> Result<()> {
+    let pid_path = root.join("rofs.pid");
+    let Ok(pid) = fs::read_to_string(&pid_path) else {
+        return Ok(());
+    };
+    let pid = pid.trim();
+    if !pid.is_empty() {
+        let _ = Command::new("kill").arg(pid).status();
+    }
+    let _ = fs::remove_file(pid_path);
+    Ok(())
+}
+
 fn exec(paths: RuntimePaths, args: &[String]) -> Result<()> {
     let ws = read_workspace(&paths, need(args, 0)?)?;
     let split = args.iter().position(|a| a == "--").unwrap_or(1);

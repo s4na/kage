@@ -1,7 +1,14 @@
 use kage_core::validate_relative_path;
 use std::{
+    collections::HashMap,
+    ffi::CString,
+    fs,
+    os::fd::RawFd,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -243,8 +250,616 @@ pub fn rofs_mount_available() -> bool {
     Path::new("/dev/fuse").exists()
 }
 
-pub fn mount_rofs_strict(_view: &GitTreeView, _mountpoint: &Path) -> Result<()> {
-    Err("kage-rofs FUSE mount is not implemented yet; GitTreeView is available as a lazy read-only model".into())
+#[derive(Debug)]
+pub struct RofsMount {
+    mountpoint: PathBuf,
+    fd: RawFd,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl RofsMount {
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn unmount(mut self) -> Result<()> {
+        unmount_path(&self.mountpoint)?;
+        unsafe {
+            close_fd(self.fd);
+        }
+        self.fd = -1;
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RofsMount {
+    fn drop(&mut self) {
+        let _ = unmount_path(&self.mountpoint);
+        unsafe {
+            close_fd(self.fd);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMount> {
+    if !rofs_mount_available() {
+        return Err("/dev/fuse is unavailable; cannot mount kage-rofs".into());
+    }
+    fs::create_dir_all(mountpoint)?;
+    let fd = unsafe { open_fuse()? };
+    let mounted = unsafe { mount_fuse(fd, mountpoint) };
+    if let Err(err) = mounted {
+        unsafe {
+            close_fd(fd);
+        }
+        return Err(err);
+    }
+    let server = FuseServer::new(view.clone());
+    let worker_fd = fd;
+    let worker = thread::spawn(move || server.serve(worker_fd));
+    Ok(RofsMount {
+        mountpoint: mountpoint.to_path_buf(),
+        fd,
+        worker: Some(worker),
+    })
+}
+
+#[derive(Clone)]
+struct InodeTable {
+    by_ino: HashMap<u64, PathBuf>,
+    by_path: HashMap<PathBuf, u64>,
+    next: u64,
+}
+
+impl InodeTable {
+    fn new() -> Self {
+        let mut by_ino = HashMap::new();
+        let mut by_path = HashMap::new();
+        by_ino.insert(1, PathBuf::new());
+        by_path.insert(PathBuf::new(), 1);
+        Self {
+            by_ino,
+            by_path,
+            next: 2,
+        }
+    }
+    fn path(&self, ino: u64) -> Option<PathBuf> {
+        self.by_ino.get(&ino).cloned()
+    }
+    fn ino_for(&mut self, path: PathBuf) -> u64 {
+        if path.as_os_str().is_empty() {
+            return 1;
+        }
+        if let Some(ino) = self.by_path.get(&path) {
+            return *ino;
+        }
+        let ino = self.next;
+        self.next += 1;
+        self.by_path.insert(path.clone(), ino);
+        self.by_ino.insert(ino, path);
+        ino
+    }
+}
+
+struct FuseServer {
+    view: GitTreeView,
+    inodes: Arc<Mutex<InodeTable>>,
+}
+
+impl FuseServer {
+    fn new(view: GitTreeView) -> Self {
+        Self {
+            view,
+            inodes: Arc::new(Mutex::new(InodeTable::new())),
+        }
+    }
+
+    fn serve(self, fd: RawFd) {
+        let mut buf = vec![0_u8; 1024 * 1024];
+        loop {
+            let n = unsafe { read_fd(fd, buf.as_mut_ptr(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            if n < FUSE_IN_HEADER_SIZE as isize {
+                continue;
+            }
+            let req = FuseInHeader::from_bytes(&buf[..n as usize]);
+            let response = self.handle(req, &buf[FUSE_IN_HEADER_SIZE..n as usize]);
+            if let Some(bytes) = response {
+                let _ = unsafe { write_fd(fd, bytes.as_ptr(), bytes.len()) };
+            }
+        }
+    }
+
+    fn handle(&self, req: FuseInHeader, body: &[u8]) -> Option<Vec<u8>> {
+        match req.opcode {
+            FUSE_INIT => Some(self.init(req.unique)),
+            FUSE_LOOKUP => Some(self.lookup(req.unique, req.nodeid, body)),
+            FUSE_GETATTR => Some(self.getattr(req.unique, req.nodeid)),
+            FUSE_OPENDIR | FUSE_OPEN => Some(open_reply(req.unique)),
+            FUSE_READDIR => Some(self.readdir(req.unique, req.nodeid, body)),
+            FUSE_READ => Some(self.read(req.unique, req.nodeid, body)),
+            FUSE_READLINK => Some(self.readlink(req.unique, req.nodeid)),
+            FUSE_STATFS => Some(self.statfs(req.unique)),
+            FUSE_RELEASE | FUSE_RELEASEDIR | FUSE_FLUSH => Some(empty_reply(req.unique)),
+            FUSE_DESTROY => None,
+            FUSE_SETATTR | FUSE_MKDIR | FUSE_UNLINK | FUSE_RMDIR | FUSE_RENAME | FUSE_WRITE
+            | FUSE_CREATE | FUSE_SYMLINK | FUSE_LINK => Some(error_reply(req.unique, EROFS)),
+            _ => Some(error_reply(req.unique, ENOSYS)),
+        }
+    }
+
+    fn lookup(&self, unique: u64, parent: u64, body: &[u8]) -> Vec<u8> {
+        let Some(name_end) = body.iter().position(|b| *b == 0) else {
+            return error_reply(unique, EINVAL);
+        };
+        let name = std::ffi::OsStr::from_bytes(&body[..name_end]);
+        let Some(parent_path) = self.inodes.lock().unwrap().path(parent) else {
+            return error_reply(unique, ENOENT);
+        };
+        let path = if parent_path.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            parent_path.join(name)
+        };
+        match self.view.lookup(&path) {
+            Ok(meta) => {
+                let ino = self.inodes.lock().unwrap().ino_for(path);
+                entry_reply(unique, ino, attr_for(ino, &meta))
+            }
+            Err(_) => error_reply(unique, ENOENT),
+        }
+    }
+
+    fn getattr(&self, unique: u64, ino: u64) -> Vec<u8> {
+        let Some(path) = self.inodes.lock().unwrap().path(ino) else {
+            return error_reply(unique, ENOENT);
+        };
+        match self.view.lookup(&path) {
+            Ok(meta) => attr_reply(unique, attr_for(ino, &meta)),
+            Err(_) => error_reply(unique, ENOENT),
+        }
+    }
+
+    fn readdir(&self, unique: u64, ino: u64, body: &[u8]) -> Vec<u8> {
+        let read = FuseReadIn::from_bytes(body);
+        let Some(path) = self.inodes.lock().unwrap().path(ino) else {
+            return error_reply(unique, ENOENT);
+        };
+        let entries = match self.view.read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => return error_reply(unique, ENOTDIR),
+        };
+        let mut packed = Vec::new();
+        let mut all = Vec::new();
+        all.push((ino, ".".as_bytes().to_vec(), DT_DIR));
+        all.push((1, "..".as_bytes().to_vec(), DT_DIR));
+        for entry in entries {
+            let entry_ino = self.inodes.lock().unwrap().ino_for(entry.path.clone());
+            let name = entry
+                .path
+                .file_name()
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_default();
+            all.push((entry_ino, name, dirent_type(&entry.kind)));
+        }
+        for (idx, (entry_ino, name, kind)) in all.into_iter().enumerate().skip(read.offset as usize)
+        {
+            let next_offset = (idx + 1) as i64;
+            let reclen = align8(FUSE_DIRENT_SIZE + name.len());
+            if packed.len() + reclen > read.size as usize {
+                break;
+            }
+            push_u64(&mut packed, entry_ino);
+            push_i64(&mut packed, next_offset);
+            push_u32(&mut packed, name.len() as u32);
+            push_u32(&mut packed, kind as u32);
+            packed.extend_from_slice(&name);
+            packed.resize(packed.len() + (reclen - FUSE_DIRENT_SIZE - name.len()), 0);
+        }
+        data_reply(unique, &packed)
+    }
+
+    fn read(&self, unique: u64, ino: u64, body: &[u8]) -> Vec<u8> {
+        let read = FuseReadIn::from_bytes(body);
+        let Some(path) = self.inodes.lock().unwrap().path(ino) else {
+            return error_reply(unique, ENOENT);
+        };
+        match self.view.read_file(&path, read.offset, read.size as usize) {
+            Ok(bytes) => data_reply(unique, &bytes),
+            Err(_) => error_reply(unique, EINVAL),
+        }
+    }
+
+    fn readlink(&self, unique: u64, ino: u64) -> Vec<u8> {
+        let Some(path) = self.inodes.lock().unwrap().path(ino) else {
+            return error_reply(unique, ENOENT);
+        };
+        match self.view.read_link(&path) {
+            Ok(target) => data_reply(unique, target.as_os_str().as_bytes()),
+            Err(_) => error_reply(unique, EINVAL),
+        }
+    }
+
+    fn init(&self, unique: u64) -> Vec<u8> {
+        let mut out = out_header(unique, 80);
+        push_u32(&mut out, 7);
+        push_u32(&mut out, 31);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 128 * 1024);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out.resize(80, 0);
+        out
+    }
+
+    fn statfs(&self, unique: u64) -> Vec<u8> {
+        let mut out = out_header(unique, 16 + 80);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 0);
+        push_u32(&mut out, 512);
+        push_u32(&mut out, 255);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out.resize(96, 0);
+        out
+    }
+}
+
+fn attr_for(ino: u64, meta: &GitMetadata) -> FuseAttr {
+    let perm = match meta.kind {
+        GitEntryKind::Tree => 0o555,
+        GitEntryKind::Executable => 0o555,
+        GitEntryKind::Symlink => 0o777,
+        GitEntryKind::Blob | GitEntryKind::Gitlink => 0o444,
+    };
+    let kind = match meta.kind {
+        GitEntryKind::Tree => S_IFDIR,
+        GitEntryKind::Symlink => S_IFLNK,
+        _ => S_IFREG,
+    };
+    FuseAttr {
+        ino,
+        size: meta.size.unwrap_or(0),
+        blocks: meta.size.unwrap_or(0).div_ceil(512),
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+        atimensec: 0,
+        mtimensec: 0,
+        ctimensec: 0,
+        mode: kind | perm,
+        nlink: if meta.is_dir() { 2 } else { 1 },
+        uid: unsafe { getuid() },
+        gid: unsafe { getgid() },
+        rdev: 0,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
+fn dirent_type(kind: &GitEntryKind) -> u8 {
+    match kind {
+        GitEntryKind::Tree => DT_DIR,
+        GitEntryKind::Symlink => DT_LNK,
+        _ => DT_REG,
+    }
+}
+
+fn open_reply(unique: u64) -> Vec<u8> {
+    let mut out = out_header(unique, 32);
+    push_u64(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    out
+}
+
+fn attr_reply(unique: u64, attr: FuseAttr) -> Vec<u8> {
+    let mut out = out_header(unique, 16 + 104);
+    push_u64(&mut out, 1);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    attr.push(&mut out);
+    out.resize(120, 0);
+    out
+}
+
+fn entry_reply(unique: u64, ino: u64, attr: FuseAttr) -> Vec<u8> {
+    let mut out = out_header(unique, 16 + 120);
+    push_u64(&mut out, ino);
+    push_u64(&mut out, 0);
+    push_u64(&mut out, 1);
+    push_u64(&mut out, 1);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    attr.push(&mut out);
+    out.resize(136, 0);
+    out
+}
+
+fn data_reply(unique: u64, data: &[u8]) -> Vec<u8> {
+    let mut out = out_header(unique, 16 + data.len());
+    out.extend_from_slice(data);
+    out
+}
+
+fn empty_reply(unique: u64) -> Vec<u8> {
+    out_header(unique, 16)
+}
+
+fn error_reply(unique: u64, errno: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    push_u32(&mut out, 16);
+    push_i32(&mut out, -errno);
+    push_u64(&mut out, unique);
+    out
+}
+
+fn out_header(unique: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    push_u32(&mut out, len as u32);
+    push_i32(&mut out, 0);
+    push_u64(&mut out, unique);
+    out
+}
+
+#[derive(Clone, Copy)]
+struct FuseInHeader {
+    opcode: u32,
+    unique: u64,
+    nodeid: u64,
+}
+
+impl FuseInHeader {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            opcode: u32_at(bytes, 8),
+            unique: u64_at(bytes, 16),
+            nodeid: u64_at(bytes, 24),
+        }
+    }
+}
+
+struct FuseReadIn {
+    offset: u64,
+    size: u32,
+}
+
+impl FuseReadIn {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            offset: u64_at(bytes, 8),
+            size: u32_at(bytes, 24),
+        }
+    }
+}
+
+struct FuseAttr {
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    atimensec: u32,
+    mtimensec: u32,
+    ctimensec: u32,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    blksize: u32,
+    flags: u32,
+}
+
+impl FuseAttr {
+    fn push(&self, out: &mut Vec<u8>) {
+        push_u64(out, self.ino);
+        push_u64(out, self.size);
+        push_u64(out, self.blocks);
+        push_u64(out, self.atime);
+        push_u64(out, self.mtime);
+        push_u64(out, self.ctime);
+        push_u32(out, self.atimensec);
+        push_u32(out, self.mtimensec);
+        push_u32(out, self.ctimensec);
+        push_u32(out, self.mode);
+        push_u32(out, self.nlink);
+        push_u32(out, self.uid);
+        push_u32(out, self.gid);
+        push_u32(out, self.rdev);
+        push_u32(out, self.blksize);
+        push_u32(out, self.flags);
+    }
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_ne_bytes());
+}
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_ne_bytes());
+}
+fn push_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_ne_bytes());
+}
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_ne_bytes());
+}
+fn push_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_ne_bytes());
+}
+fn align8(value: usize) -> usize {
+    (value + 7) & !7
+}
+
+unsafe fn open_fuse() -> Result<RawFd> {
+    let path = CString::new("/dev/fuse")?;
+    let fd = c_open(path.as_ptr(), O_RDWR | O_CLOEXEC, 0);
+    if fd < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(fd)
+    }
+}
+
+unsafe fn mount_fuse(fd: RawFd, mountpoint: &Path) -> Result<()> {
+    let source = CString::new("kage-rofs")?;
+    let target = CString::new(mountpoint.as_os_str().as_bytes())?;
+    let fstype = CString::new("fuse")?;
+    let opts = CString::new(format!(
+        "fd={fd},rootmode=40000,user_id={},group_id={},default_permissions,ro,fsname=kage-rofs,subtype=kage-rofs",
+        getuid(),
+        getgid()
+    ))?;
+    let rc = c_mount(
+        source.as_ptr(),
+        target.as_ptr(),
+        fstype.as_ptr(),
+        MS_NOSUID | MS_NODEV | MS_RDONLY,
+        opts.as_ptr().cast(),
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "kage-rofs fuse mount failed: {}; /dev/fuse and CAP_SYS_ADMIN or a mount helper are required",
+            std::io::Error::last_os_error()
+        )
+        .into())
+    }
+}
+
+fn unmount_path(path: &Path) -> Result<()> {
+    let target = CString::new(path.as_os_str().as_bytes())?;
+    let rc = unsafe { c_umount2(target.as_ptr(), MNT_DETACH) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(EINVAL) {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+unsafe fn close_fd(fd: RawFd) {
+    if fd >= 0 {
+        let _ = c_close(fd);
+    }
+}
+unsafe fn read_fd(fd: RawFd, buf: *mut u8, len: usize) -> isize {
+    c_read(fd, buf.cast(), len)
+}
+unsafe fn write_fd(fd: RawFd, buf: *const u8, len: usize) -> isize {
+    c_write(fd, buf.cast(), len)
+}
+
+const O_RDWR: i32 = 0o2;
+const O_CLOEXEC: i32 = 0o2000000;
+const MS_RDONLY: usize = 1;
+const MS_NOSUID: usize = 2;
+const MS_NODEV: usize = 4;
+const MNT_DETACH: i32 = 2;
+const EINVAL: i32 = 22;
+const ENOENT: i32 = 2;
+const ENOSYS: i32 = 38;
+const ENOTDIR: i32 = 20;
+const EROFS: i32 = 30;
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFLNK: u32 = 0o120000;
+const DT_REG: u8 = 8;
+const DT_DIR: u8 = 4;
+const DT_LNK: u8 = 10;
+const FUSE_LOOKUP: u32 = 1;
+const FUSE_GETATTR: u32 = 3;
+const FUSE_SETATTR: u32 = 4;
+const FUSE_READLINK: u32 = 5;
+const FUSE_SYMLINK: u32 = 6;
+const FUSE_MKDIR: u32 = 9;
+const FUSE_UNLINK: u32 = 10;
+const FUSE_RMDIR: u32 = 11;
+const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
+const FUSE_OPEN: u32 = 14;
+const FUSE_READ: u32 = 15;
+const FUSE_WRITE: u32 = 16;
+const FUSE_STATFS: u32 = 17;
+const FUSE_RELEASE: u32 = 18;
+const FUSE_FLUSH: u32 = 25;
+const FUSE_INIT: u32 = 26;
+const FUSE_OPENDIR: u32 = 27;
+const FUSE_READDIR: u32 = 28;
+const FUSE_RELEASEDIR: u32 = 29;
+const FUSE_DESTROY: u32 = 38;
+const FUSE_CREATE: u32 = 35;
+const FUSE_IN_HEADER_SIZE: usize = 40;
+const FUSE_DIRENT_SIZE: usize = 24;
+
+unsafe extern "C" {
+    fn open(path: *const i8, flags: i32, mode: u32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+    fn mount(
+        source: *const i8,
+        target: *const i8,
+        filesystemtype: *const i8,
+        mountflags: usize,
+        data: *const std::ffi::c_void,
+    ) -> i32;
+    fn umount2(target: *const i8, flags: i32) -> i32;
+    fn getuid() -> u32;
+    fn getgid() -> u32;
+}
+
+unsafe fn c_open(path: *const i8, flags: i32, mode: u32) -> i32 {
+    open(path, flags, mode)
+}
+unsafe fn c_close(fd: i32) -> i32 {
+    close(fd)
+}
+unsafe fn c_read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize {
+    read(fd, buf, count)
+}
+unsafe fn c_write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize {
+    write(fd, buf, count)
+}
+unsafe fn c_mount(
+    source: *const i8,
+    target: *const i8,
+    filesystemtype: *const i8,
+    mountflags: usize,
+    data: *const std::ffi::c_void,
+) -> i32 {
+    mount(source, target, filesystemtype, mountflags, data)
+}
+unsafe fn c_umount2(target: *const i8, flags: i32) -> i32 {
+    umount2(target, flags)
 }
 
 #[cfg(test)]
@@ -337,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn rofs_mount_strict_fails_until_fuse_mount_is_implemented() {
+    fn rofs_mount_strict_requires_real_read_only_mount() {
         if std::env::var_os("KAGE_TEST_ROFS").is_none() {
             eprintln!(
                 "skipping rofs mount test; set KAGE_TEST_ROFS=1 to require a real rofs mount"
@@ -348,11 +963,27 @@ mod tests {
         let view = GitTreeView::open(&repo, "main").unwrap();
         let mount = temp("mount");
         fs::create_dir_all(&mount).unwrap();
-        let err = mount_rofs_strict(&view, &mount).unwrap_err().to_string();
-        if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() {
-            eprintln!("WARNING: skipping rofs mount body: {err}");
-        } else {
-            panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}");
+        match mount_rofs_strict(&view, &mount) {
+            Ok(handle) => {
+                assert_eq!(
+                    fs::read_to_string(mount.join("README.md")).unwrap(),
+                    "hello world"
+                );
+                assert_eq!(
+                    fs::read(mount.join("binary.bin")).unwrap(),
+                    vec![0, 1, 2, 255]
+                );
+                assert_eq!(
+                    fs::read_link(mount.join("link")).unwrap(),
+                    PathBuf::from("README.md")
+                );
+                assert!(fs::write(mount.join("new.txt"), "nope").is_err());
+                handle.unmount().unwrap();
+            }
+            Err(err) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
+                eprintln!("WARNING: skipping rofs mount body: {err}");
+            }
+            Err(err) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
         }
         fs::remove_dir_all(repo).unwrap();
         fs::remove_dir_all(mount).unwrap();
