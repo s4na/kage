@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/kage-core", "crates/kage-git", "crates/kage-overlay", "crates/kage-cli", "crates/kage-container"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/satoshi-nabetani/kage"
+rust-version = "1.80"
