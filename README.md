@@ -276,6 +276,10 @@ cargo test --workspace --all-features
 
 The default test suite uses temporary Git repositories and does not require network access. Pure `GitTreeView` tests run by default. Rofs mount, overlayfs, container, and VM execution are environment-dependent. `KAGE_TEST_ROFS=1` requires a real rofs FUSE mount and fails if `/dev/fuse` or mount capability is missing. `KAGE_TEST_OVERLAY=1` requires a real overlayfs mount and fails if overlayfs or `CAP_SYS_ADMIN` is missing. Real Docker/Podman/Apple Container execution should be manually verified on the target host.
 
+### Current proof level
+
+In the Codex/container environment used for this change, kage is proven through **Level 1** only: default checks plus GitTreeView and mount-free rofs protocol tests. **Level 2**, **Level 3**, and **Level 4** require a Linux host/VM with `/dev/fuse` and overlay mount capability. Allow-skip runs are diagnostic only and are not proof. Production readiness requires Level 4 passing. The current rofs mount layer is hand-written FUSE; it remains a review risk unless it is replaced with a maintained crate such as `fuser` or strict kernel tests pass on a capable host. See `docs/fuse-risk.md`.
+
 ### Verification levels
 
 - **Level 0:** default `cargo fmt`, `cargo clippy`, and `cargo test --workspace --all-features`. Proven in this environment.
@@ -288,10 +292,12 @@ The default test suite uses temporary Git repositories and does not require netw
 A privileged Docker route is provided for Linux hosts that can run nested mounts:
 
 ```bash
+scripts/run-docker-privileged-rofs-overlay-tests.sh
+# Backward-compatible alias:
 scripts/run-privileged-linux-tests.sh
 ```
 
-This script runs default checks plus strict rofs, overlayfs, and combined rofs+overlay tests inside a privileged Linux container with `/dev/fuse` passed through. Hosted CI runners may not provide the required kernel capabilities; use a capable local Linux host, VM, or self-hosted runner.
+This script installs/checks Linux test prerequisites where possible, then runs default checks plus strict rofs, overlayfs, combined rofs+overlay, and runtime smoke tests inside a privileged Linux container with `/dev/fuse` passed through. Hosted CI runners may not provide the required kernel capabilities; use a capable local Linux host, VM, or self-hosted runner.
 
 ## Development notes
 

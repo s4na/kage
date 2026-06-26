@@ -299,3 +299,97 @@ fn rofs_serve_rejects_invalid_repo_ref_or_mountpoint() {
     let _ = fs::remove_dir_all(home);
     let _ = fs::remove_dir_all(mount);
 }
+
+#[test]
+fn strict_rofs_overlay_runtime_smoke_when_enabled() {
+    if std::env::var_os("KAGE_TEST_RUNTIME").is_none() {
+        eprintln!("skipping runtime smoke test; set KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 on a capable Linux host");
+        return;
+    }
+    assert!(
+        std::env::var_os("KAGE_TEST_ROFS").is_some()
+            && std::env::var_os("KAGE_TEST_OVERLAY").is_some(),
+        "KAGE_TEST_RUNTIME=1 requires KAGE_TEST_ROFS=1 and KAGE_TEST_OVERLAY=1"
+    );
+
+    let repo = setup_repo();
+    let home = temp("home-runtime");
+    let out = kage(
+        &home,
+        &[
+            "workspace",
+            "create",
+            "--ref",
+            "main",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--id",
+            "ws_runtime",
+            "--backend",
+            "overlayfs",
+            "--lower",
+            "git-rofs",
+        ],
+    );
+    if !out.status.success()
+        && (std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some()
+            || std::env::var_os("KAGE_TEST_OVERLAY_ALLOW_SKIP").is_some())
+    {
+        eprintln!(
+            "WARNING: skipping strict runtime smoke body because create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(home);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "runtime workspace create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let merged = home.join("workspaces/ws_runtime/merged");
+    assert_eq!(
+        fs::read_to_string(merged.join("README.md")).unwrap(),
+        "hello"
+    );
+    fs::write(merged.join("README.md"), "runtime modified").unwrap();
+    fs::write(merged.join("runtime-added.txt"), "runtime added").unwrap();
+    fs::remove_file(merged.join("delete.txt")).unwrap();
+
+    let out = kage(
+        &home,
+        &["workspace", "commit", "ws_runtime", "-m", "runtime smoke"],
+    );
+    assert!(
+        out.status.success(),
+        "runtime commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        git_out(&repo, &["show", "main:README.md"]),
+        "runtime modified"
+    );
+    assert_eq!(
+        git_out(&repo, &["show", "main:runtime-added.txt"]),
+        "runtime added"
+    );
+    assert_eq!(
+        git_out(
+            &repo,
+            &["ls-tree", "--name-only", "main", "--", "delete.txt"]
+        ),
+        ""
+    );
+
+    let out = kage(&home, &["workspace", "discard", "ws_runtime"]);
+    assert!(
+        out.status.success(),
+        "runtime discard failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!home.join("workspaces/ws_runtime").exists());
+    fs::remove_dir_all(repo).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}

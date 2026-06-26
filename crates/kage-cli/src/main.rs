@@ -9,6 +9,7 @@ use kage_git::GitRepo;
 use kage_overlay::{backend_for, BackendKind, BackendPaths};
 use std::{
     env, fs,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -244,7 +245,38 @@ fn rofs_serve_command(exe: &Path, ws: &WorkspaceSpec, stderr: fs::File) -> Comma
 }
 
 fn rofs_mount_ready(mountpoint: &Path) -> bool {
-    fs::read_dir(mountpoint).is_ok()
+    path_is_mountpoint(mountpoint).unwrap_or(false)
+}
+
+fn path_is_mountpoint(path: &Path) -> Result<bool> {
+    let needle = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(unescape_mountinfo_path)
+            .is_some_and(|mount| mount == needle)
+    }))
+}
+
+fn unescape_mountinfo_path(raw: &str) -> PathBuf {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\\' && idx + 3 < bytes.len() {
+            if let Ok(octal) = std::str::from_utf8(&bytes[idx + 1..idx + 4]) {
+                if let Ok(value) = u8::from_str_radix(octal, 8) {
+                    out.push(value);
+                    idx += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
 fn stop_rofs_daemon(root: &Path) -> Result<()> {
@@ -359,6 +391,100 @@ mod tests {
         assert_eq!(args[2], "/repo path/with spaces");
         assert!(args.contains(&"--mountpoint".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("sh -c")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Default)]
+    struct FakeRuntimeLifecycle {
+        events: Vec<&'static str>,
+        overlay_fails: bool,
+        commit_fails: bool,
+        metadata_written: bool,
+        ref_updated: bool,
+    }
+
+    impl FakeRuntimeLifecycle {
+        fn create(&mut self) -> Result<()> {
+            self.events.push("start-rofs");
+            self.events.push("mount-overlay");
+            if self.overlay_fails {
+                self.events.push("stop-rofs");
+                return Err("overlay mount failed".into());
+            }
+            self.metadata_written = true;
+            self.events.push("write-metadata");
+            Ok(())
+        }
+
+        fn discard(&mut self) {
+            self.events.push("unmount-overlay");
+            self.events.push("stop-rofs");
+            self.events.push("remove-metadata");
+            self.metadata_written = false;
+        }
+
+        fn commit(&mut self) -> Result<()> {
+            self.events.push("commit-from-upper");
+            if self.commit_fails {
+                return Err("commit failed before ref update".into());
+            }
+            self.ref_updated = true;
+            self.events.push("update-ref");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fake_runtime_lifecycle_rolls_back_rofs_when_overlay_mount_fails() {
+        let mut lifecycle = FakeRuntimeLifecycle {
+            overlay_fails: true,
+            ..Default::default()
+        };
+        assert!(lifecycle.create().is_err());
+        assert_eq!(
+            lifecycle.events,
+            ["start-rofs", "mount-overlay", "stop-rofs"]
+        );
+        assert!(!lifecycle.metadata_written);
+    }
+
+    #[test]
+    fn fake_runtime_lifecycle_records_metadata_unmounts_in_order_and_preserves_failed_commit_mounts(
+    ) {
+        let mut lifecycle = FakeRuntimeLifecycle::default();
+        lifecycle.create().unwrap();
+        assert!(lifecycle.metadata_written);
+        assert_eq!(
+            lifecycle.events,
+            ["start-rofs", "mount-overlay", "write-metadata"]
+        );
+
+        lifecycle.commit_fails = true;
+        assert!(lifecycle.commit().is_err());
+        assert!(!lifecycle.ref_updated);
+        assert!(
+            lifecycle.metadata_written,
+            "failed commit must not tear down a mounted workspace"
+        );
+
+        lifecycle.discard();
+        lifecycle.discard();
+        assert!(lifecycle
+            .events
+            .windows(2)
+            .any(|w| w == ["unmount-overlay", "stop-rofs"]));
+        assert!(!lifecycle.metadata_written);
+    }
+
+    #[test]
+    fn rofs_mount_ready_rejects_plain_directory_and_decodes_mountinfo_escapes() {
+        let root = temp("mount-ready");
+        fs::create_dir_all(&root).unwrap();
+        assert!(!rofs_mount_ready(&root));
+        assert_eq!(
+            unescape_mountinfo_path("/tmp/path\\040with\\011space"),
+            PathBuf::from("/tmp/path with\tspace")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
