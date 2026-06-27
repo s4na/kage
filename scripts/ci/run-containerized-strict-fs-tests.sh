@@ -2,24 +2,42 @@
 set -euo pipefail
 
 mkdir -p target/ci-proof target/ci-logs
+for log in \
+  target/ci-logs/container_probe.log \
+  target/ci-logs/container_strict_rofs.log \
+  target/ci-logs/container_strict_overlay.log \
+  target/ci-logs/container_strict_combined.log \
+  target/ci-logs/container_strict_runtime.log; do
+  : > "$log"
+done
 container_env=target/ci-proof/container.env
+host_container_env=target/ci-proof/container-host.env
 : > "$container_env"
+: > "$host_container_env"
 STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
 IMAGE="${KAGE_CONTAINER_STRICT_IMAGE:-kage-strict:ci}"
 DOCKERFILE="${KAGE_CONTAINER_STRICT_DOCKERFILE:-.github/docker/kage-strict/Dockerfile}"
 
-echo "containerized_strict_attempted=true" >> "$container_env"
-echo "containerized_strict_image=$IMAGE" >> "$container_env"
-echo "containerized_privileged_attempted=true" >> "$container_env"
+echo "containerized_strict_attempted=true" >> "$host_container_env"
+echo "containerized_strict_image=$IMAGE" >> "$host_container_env"
+echo "containerized_privileged_attempted=true" >> "$host_container_env"
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "containerized_docker_available=false" >> "$container_env"
+  echo "containerized_docker_available=false" >> "$host_container_env"
   echo "docker unavailable; containerized strict proof not attempted" | tee target/ci-logs/container_probe.log
   exit 0
 fi
-echo "containerized_docker_available=true" >> "$container_env"
+echo "containerized_docker_available=true" >> "$host_container_env"
 
+set +e
 docker build -f "$DOCKERFILE" -t "$IMAGE" . 2>&1 | tee target/ci-logs/container_image_build.log
+build_status=${PIPESTATUS[0]}
+set -e
+echo "containerized_image_build_status=$build_status" >> "$host_container_env"
+if [ "$build_status" -ne 0 ]; then
+  echo "container strict image build failed with status $build_status; see target/ci-logs/container_image_build.log" | tee -a target/ci-logs/container_probe.log
+  exit 0
+fi
 
 container_payload='set -euo pipefail
 mkdir -p /out/logs /out/proof /work/kage
@@ -31,7 +49,8 @@ record containerized_strict_image "${KAGE_CONTAINER_STRICT_IMAGE:-unknown}"
 status_value=999
 error_kind_from_log() {
   local log="$1"
-  if grep -Eqi "Invalid argument|os error 22|EINVAL" "$log"; then echo direct_mount_einval
+  if grep -Eqi "fuser_backend_unavailable|fuser_mount_error" "$log"; then echo fuser_backend_failure
+  elif grep -Eqi "Invalid argument|os error 22|EINVAL" "$log"; then echo direct_mount_einval
   elif grep -Eqi "/dev/fuse is unavailable|No such file or directory.*/dev/fuse" "$log"; then echo missing_dev_fuse
   elif grep -Eqi "timed out|timeout|Command exited with non-zero status 124" "$log"; then echo timeout
   elif grep -Eqi "Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN|permission denied" "$log"; then echo permission_denied
@@ -97,10 +116,10 @@ tar -C /src --exclude=target -cf - . | tar -C /work/kage -xf -
 cd /work/kage
 cargo --version | tee -a /out/logs/container_probe.log
 rustc --version | tee -a /out/logs/container_probe.log
-run_strict rofs env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib tests::rofs_mount_strict_requires_real_read_only_mount -- --exact --nocapture --test-threads=1
+run_strict rofs env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser cargo test -p kage-rofs --lib tests::rofs_mount_strict_requires_real_read_only_mount -- --exact --nocapture --test-threads=1
 run_strict overlay env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict combined env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict runtime env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_strict combined env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_strict runtime env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
 cat /out/proof/container.env
 '
 
@@ -126,13 +145,13 @@ status=$?
 set -e
 if [ "$status" -ne 0 ]; then
   echo "containerized privileged run with apparmor=unconfined exited $status; retrying without apparmor" | tee -a target/ci-logs/container_probe.log
-  echo "containerized_apparmor_unconfined_status=$status" >> "$container_env"
+  echo "containerized_apparmor_unconfined_status=$status" >> "$host_container_env"
   set +e
   run_container
   status=$?
   set -e
 fi
-echo "containerized_docker_run_status=$status" >> "$container_env"
+echo "containerized_docker_run_status=$status" >> "$host_container_env"
 if [ -f target/ci-proof/container.env ]; then
   # Container writes this file via /out/proof; keep it as the canonical container result.
   true

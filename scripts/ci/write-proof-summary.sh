@@ -8,6 +8,7 @@ combined_env=target/ci-proof/combined.env
 classification_env=target/ci-proof/classification.env
 : > "$combined_env"
 [ -f target/ci-proof/env.sh ] && cat target/ci-proof/env.sh >> "$combined_env"
+[ -f target/ci-proof/container-host.env ] && cat target/ci-proof/container-host.env >> "$combined_env"
 [ -f target/ci-proof/container.env ] && cat target/ci-proof/container.env >> "$combined_env"
 if [ -f target/ci-proof/results.env ]; then
   sed '/^[^=]*_command=/d' target/ci-proof/results.env >> "$combined_env"
@@ -142,6 +143,7 @@ git_index_conflict_re = re.compile(r"appears as both a file and as a directory|c
 tree_mismatch_re = re.compile(r"assertion.*left.*right|tree hash mismatch|fallback tree hash|overlay tree hash", re.I | re.S)
 timeout_re = re.compile(r"timed out|timeout|has been running for over 60 seconds|status: 143|Command exited with non-zero status 124", re.I)
 rofs_einval_re = re.compile(r"kage-rofs fuse mount failed:.*Invalid argument|direct FUSE mount returned EINVAL|os error 22", re.I)
+fuser_backend_re = re.compile(r"fuser_backend_unavailable|fuser_mount_error|fuser_.*timeout|fuser_kernel_error", re.I)
 capable_overlay_failed = as_int("overlay_sudo_mount_status") == 0 and attempted("strict_overlay_sudo") and not passed("strict_overlay_sudo")
 capable_rofs_failed = (
     getenv("dev_fuse_exists") == "true"
@@ -182,7 +184,20 @@ elif getenv("dev_fuse_exists") == "true" and getenv("sudo_available") == "true" 
     classification = "environment_unsupported"
     classification_detail = "Level 1 only; /dev/fuse and sudo are present but strict privileged/helper routes were not attempted"
     terminal_classification = "LEVEL1_MOUNT_FREE_ONLY_PROVEN"
-elif not any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs", "strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay", "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined", "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime") and as_int("apt_status") == 999:
+elif as_int("containerized_image_build_status") not in (0, 999):
+    classification = "setup_defect"
+    classification_detail = "containerized strict image build failed before strict tests could run"
+    terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
+elif containerized_any_failed and (
+    getenv("containerized_dev_fuse_exists") == "true"
+    and getenv("containerized_dev_fuse_readable_writable") == "true"
+    and (getenv("containerized_fusermount3_available") == "true" or getenv("containerized_fuse_overlayfs_available") == "true")
+    and (as_int("containerized_overlay_mount_status") == 0 or as_int("containerized_fuse_overlayfs_status") == 0 or containerized_overlay_passed)
+):
+    classification = "implementation_failure"
+    classification_detail = "containerized privileged route reproduced kage-rofs mounted-read timeout or fuser backend failure"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif not any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs", "strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay", "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined", "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime") and not containerized_strict_attempted and not containerized_any_attempted and as_int("containerized_docker_run_status") == 999 and as_int("apt_status") == 999:
     classification = "not_run"
     classification_detail = "proof summary generated without probe or strict-result inputs"
     terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
@@ -206,7 +221,11 @@ elif capable_rofs_failed and rofs_einval_re.search(text):
     classification = "implementation_failure"
     classification_detail = "sudo/helper rofs route was available, but direct kage-rofs FUSE mount returned EINVAL"
     terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
-elif containerized_any_failed and (timeout_re.search(text) or tree_mismatch_re.search(text) or rofs_einval_re.search(text) or getenv("containerized_dev_fuse_exists") == "true" or getenv("containerized_overlay_mount_status") == "0"):
+elif capable_rofs_failed and fuser_backend_re.search(text):
+    classification = "implementation_failure"
+    classification_detail = "fuser rofs backend failed before strict Level 2 proof"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif containerized_any_failed and (timeout_re.search(text) or tree_mismatch_re.search(text) or rofs_einval_re.search(text) or fuser_backend_re.search(text) or getenv("containerized_dev_fuse_exists") == "true" or getenv("containerized_overlay_mount_status") == "0"):
     classification = "implementation_failure"
     classification_detail = "containerized privileged strict route was attempted but did not produce a strict proof"
     terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
@@ -327,6 +346,10 @@ summary = {
     "containerized_strict_attempted": containerized_strict_attempted,
     "containerized_strict_image": getenv("containerized_strict_image"),
     "containerized_privileged_attempted": as_bool("containerized_privileged_attempted"),
+    "containerized_docker_available": getenv("containerized_docker_available", "unknown"),
+    "containerized_image_build_status": as_int("containerized_image_build_status"),
+    "containerized_apparmor_unconfined_status": as_int("containerized_apparmor_unconfined_status"),
+    "containerized_docker_run_status": as_int("containerized_docker_run_status"),
     "containerized_dev_fuse_exists": getenv("containerized_dev_fuse_exists", "unknown"),
     "containerized_dev_fuse_readable_writable": getenv("containerized_dev_fuse_readable_writable", "unknown"),
     "containerized_fusermount3_available": getenv("containerized_fusermount3_available", "unknown"),
@@ -401,6 +424,10 @@ cat > "$summary_md" <<MD
 | strict combined status | ${strict_combined_status:-999} |
 | strict runtime status | ${strict_runtime_status:-999} |
 | containerized strict image | ${containerized_strict_image:-unknown} |
+| containerized docker available | ${containerized_docker_available:-unknown} |
+| containerized image build status | ${containerized_image_build_status:-999} |
+| containerized apparmor=unconfined status | ${containerized_apparmor_unconfined_status:-999} |
+| containerized docker run status | ${containerized_docker_run_status:-999} |
 | containerized /dev/fuse exists | ${containerized_dev_fuse_exists:-unknown} |
 | containerized /dev/fuse read/write | ${containerized_dev_fuse_readable_writable:-unknown} |
 | containerized overlay mount status | ${containerized_overlay_mount_status:-999} |
