@@ -840,18 +840,16 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
     unsafe {
         close_fd(fds[1]);
     }
-    let output = child.wait_with_output()?;
-    if output.status.success() && fd >= 0 {
+    if fd >= 0 {
+        thread::spawn(move || {
+            let _ = child.wait_with_output();
+        });
         unsafe {
             let _ = c_fcntl(fd, F_SETFD, FD_CLOEXEC);
         }
         Ok(fd)
     } else {
-        if fd >= 0 {
-            unsafe {
-                close_fd(fd);
-            }
-        }
+        let output = child.wait_with_output()?;
         Err(format!(
             "fusermount3 failed status={} stderr={}",
             output.status,
