@@ -77,3 +77,29 @@ Paste back the workflow run URL plus `target/ci-proof/summary.json`, `target/ci-
 ## Classification note from run 28281744534
 
 A prior GitHub Actions artifact from `https://github.com/s4na/kage/actions/runs/28281744534` reported Level 1 and `STRONG_ENVIRONMENT_BLOCKED` even though `/dev/fuse`, passwordless `sudo`, `fuse3`, and `fuse-overlayfs` were available. That classification was too strong because the harness had not yet tried sudo/helper routes. New summaries should classify that shape as `LEVEL1_MOUNT_FREE_ONLY_PROVEN` unless the privileged/helper matrix has actually been exercised and failed for environment reasons. If that matrix reaches a capable route (for example sudo overlay probe succeeds or sudo has `CAP_SYS_ADMIN`) and strict kage commands then fail with Git index conflicts or direct FUSE `EINVAL`, the summary must prefer `IMPLEMENTATION_BUG_WITH_REPRO` over `STRONG_ENVIRONMENT_BLOCKED`.
+
+## Containerized strict filesystem route
+
+The default CI keeps the direct host-runner strict route and also adds a parallel
+`fs-capability-probe-containerized` job. That job builds the repository-local
+`.github/docker/kage-strict/Dockerfile`, starts one privileged Linux container
+with `/dev/fuse`, `CAP_SYS_ADMIN`, and a `/tmp` tmpfs, copies the checked-out
+repository from a read-only `/src` bind mount into `/work/kage`, and runs the
+focused strict rofs, overlay, combined, and runtime smoke tests there. The tests
+therefore do not mutate the host workspace bind mount.
+
+This is intentionally not Docker-in-Docker yet. Job containers and service
+containers are useful for later agent/container integration tests, but DinD does
+not create a new kernel and still needs privileged mode for nested Docker and
+mount-heavy filesystem tests. The first proof route is direct host Docker running
+one privileged disposable test container; DinD can be added later if the runtime
+needs to verify nested container orchestration specifically.
+
+Containerized strict proof is reported separately in `target/ci-proof/summary.json`
+under `containerized_*` fields and uploads logs named
+`container_probe.log`, `container_strict_rofs.log`,
+`container_strict_overlay.log`, `container_strict_combined.log`, and
+`container_strict_runtime.log`. A containerized Level 4 pass counts as proof only
+when the strict runtime smoke test passes without allow-skip; if only the
+container route passes, release notes must state that the proof is for a
+privileged containerized Linux runtime.

@@ -8,6 +8,7 @@ combined_env=target/ci-proof/combined.env
 classification_env=target/ci-proof/classification.env
 : > "$combined_env"
 [ -f target/ci-proof/env.sh ] && cat target/ci-proof/env.sh >> "$combined_env"
+[ -f target/ci-proof/container.env ] && cat target/ci-proof/container.env >> "$combined_env"
 if [ -f target/ci-proof/results.env ]; then
   sed '/^[^=]*_command=/d' target/ci-proof/results.env >> "$combined_env"
 fi
@@ -66,6 +67,22 @@ strict_rofs_attempted = any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "
 strict_overlay_attempted = any_attempt("strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay")
 strict_combined_attempted = any_attempt("strict_combined_nonsudo", "strict_combined_sudo", "strict_combined")
 strict_runtime_attempted = any_attempt("strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime")
+containerized_strict_attempted = as_bool("containerized_strict_attempted")
+containerized_rofs_attempted = as_bool("containerized_rofs_attempted") or as_int("containerized_rofs_status") != 999
+containerized_rofs_passed = containerized_rofs_attempted and as_int("containerized_rofs_status") == 0 and not allow_skip_used
+containerized_overlay_attempted = as_bool("containerized_overlay_attempted") or as_int("containerized_overlay_status") != 999
+containerized_overlay_passed = containerized_overlay_attempted and as_int("containerized_overlay_status") == 0 and not allow_skip_used
+containerized_combined_attempted = as_bool("containerized_combined_attempted") or as_int("containerized_combined_status") != 999
+containerized_combined_passed = containerized_combined_attempted and as_int("containerized_combined_status") == 0 and not allow_skip_used
+containerized_runtime_attempted = as_bool("containerized_runtime_attempted") or as_int("containerized_runtime_status") != 999
+containerized_runtime_passed = containerized_runtime_attempted and as_int("containerized_runtime_status") == 0 and not allow_skip_used
+containerized_any_attempted = any([containerized_rofs_attempted, containerized_overlay_attempted, containerized_combined_attempted, containerized_runtime_attempted])
+containerized_any_failed = any([
+    containerized_rofs_attempted and not containerized_rofs_passed,
+    containerized_overlay_attempted and not containerized_overlay_passed,
+    containerized_combined_attempted and not containerized_combined_passed,
+    containerized_runtime_attempted and not containerized_runtime_passed,
+])
 
 privileged_route_attempted = any_attempt(
     "strict_rofs_sudo", "strict_overlay_sudo", "strict_combined_sudo", "strict_runtime_sudo"
@@ -89,6 +106,9 @@ for name in [
 ]:
     if attempted(name) and status(name) != 0:
         failing_tests.append(name)
+for name in ["rofs", "overlay", "combined", "runtime"]:
+    if as_bool(f"containerized_{name}_attempted") and as_int(f"containerized_{name}_status") != 0:
+        failing_tests.append(f"containerized_{name}")
 
 environment_blockers = []
 if getenv("dev_fuse_exists") == "false":
@@ -139,19 +159,19 @@ strict_proof_obtained = False
 
 if allow_skip_used:
     classification_detail = "allow-skip variable was set in a strict proof job"
-elif strict_runtime_passed:
+elif strict_runtime_passed or containerized_runtime_passed:
     classification = "proof_passed"
     classification_detail = "Level 4 runtime smoke passed without allow-skip"
     terminal_classification = "LEVEL4_RUNTIME_PROVEN"
     proof_level = 4
     strict_proof_obtained = True
-elif strict_combined_passed or (strict_rofs_passed and strict_overlay_passed):
+elif strict_combined_passed or containerized_combined_passed or (strict_rofs_passed and strict_overlay_passed) or (containerized_rofs_passed and containerized_overlay_passed):
     classification = "proof_passed"
     classification_detail = "Level 3 rofs/overlay substrate passed without full runtime smoke"
     terminal_classification = "LEVEL3_OVERLAY_AND_LOWER_PROVEN_BUT_RUNTIME_NOT_PROVEN"
     proof_level = 3
     strict_proof_obtained = True
-elif strict_rofs_passed:
+elif strict_rofs_passed or containerized_rofs_passed:
     classification = "proof_passed"
     classification_detail = "Level 2 rofs FUSE mount passed; overlay/runtime did not"
     terminal_classification = "LEVEL2_ROFS_PROVEN_BUT_OVERLAY_OR_RUNTIME_NOT_PROVEN"
@@ -185,6 +205,10 @@ elif capable_rofs_failed and rofs_einval_re.search(text):
     classification = "implementation_failure"
     classification_detail = "sudo/helper rofs route was available, but direct kage-rofs FUSE mount returned EINVAL"
     terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif containerized_any_failed and (timeout_re.search(text) or tree_mismatch_re.search(text) or rofs_einval_re.search(text) or getenv("containerized_dev_fuse_exists") == "true" or getenv("containerized_overlay_mount_status") == "0"):
+    classification = "implementation_failure"
+    classification_detail = "containerized privileged strict route was attempted but did not produce a strict proof"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
 elif permission_re.search(text) and (privileged_route_attempted or helper_or_priv_probe_attempted) and not (capable_rofs_failed or capable_overlay_failed):
     classification = "environment_unsupported"
     classification_detail = "strict filesystem proof failed after non-sudo and privileged/helper routes were attempted"
@@ -210,6 +234,11 @@ artifact_paths = [
     "target/ci-logs/strict_combined_sudo.log",
     "target/ci-logs/strict_runtime_nonsudo.log",
     "target/ci-logs/strict_runtime_sudo.log",
+    "target/ci-logs/container_probe.log",
+    "target/ci-logs/container_strict_rofs.log",
+    "target/ci-logs/container_strict_overlay.log",
+    "target/ci-logs/container_strict_combined.log",
+    "target/ci-logs/container_strict_runtime.log",
 ]
 summary = {
     "runner": {
@@ -292,6 +321,29 @@ summary = {
     "failing_tests": failing_tests,
     "artifact_paths": artifact_paths,
     "workflow_run_url": workflow_run_url,
+    "proof_routes": [route for route, present in [("host", strict_rofs_attempted or strict_overlay_attempted or strict_combined_attempted or strict_runtime_attempted), ("containerized", containerized_strict_attempted)] if present],
+    "containerized_strict_attempted": containerized_strict_attempted,
+    "containerized_strict_image": getenv("containerized_strict_image"),
+    "containerized_privileged_attempted": as_bool("containerized_privileged_attempted"),
+    "containerized_dev_fuse_exists": getenv("containerized_dev_fuse_exists", "unknown"),
+    "containerized_dev_fuse_readable_writable": getenv("containerized_dev_fuse_readable_writable", "unknown"),
+    "containerized_fusermount3_available": getenv("containerized_fusermount3_available", "unknown"),
+    "containerized_fuse_overlayfs_available": getenv("containerized_fuse_overlayfs_available", "unknown"),
+    "containerized_overlay_available": getenv("containerized_overlay_available", "unknown"),
+    "containerized_overlay_mount_status": as_int("containerized_overlay_mount_status"),
+    "containerized_fuse_overlayfs_status": as_int("containerized_fuse_overlayfs_status"),
+    "containerized_rofs_attempted": containerized_rofs_attempted,
+    "containerized_rofs_passed": containerized_rofs_passed,
+    "containerized_rofs_error_kind": getenv("containerized_rofs_error_kind"),
+    "containerized_overlay_attempted": containerized_overlay_attempted,
+    "containerized_overlay_passed": containerized_overlay_passed,
+    "containerized_overlay_error_kind": getenv("containerized_overlay_error_kind"),
+    "containerized_combined_attempted": containerized_combined_attempted,
+    "containerized_combined_passed": containerized_combined_passed,
+    "containerized_combined_error_kind": getenv("containerized_combined_error_kind"),
+    "containerized_runtime_attempted": containerized_runtime_attempted,
+    "containerized_runtime_passed": containerized_runtime_passed,
+    "containerized_runtime_error_kind": getenv("containerized_runtime_error_kind"),
     "classification": classification,
     "classification_detail": classification_detail,
 }
@@ -344,6 +396,15 @@ cat > "$summary_md" <<MD
 | strict overlay status | ${strict_overlay_status:-999} |
 | strict combined status | ${strict_combined_status:-999} |
 | strict runtime status | ${strict_runtime_status:-999} |
+| containerized strict image | ${containerized_strict_image:-unknown} |
+| containerized /dev/fuse exists | ${containerized_dev_fuse_exists:-unknown} |
+| containerized /dev/fuse read/write | ${containerized_dev_fuse_readable_writable:-unknown} |
+| containerized overlay mount status | ${containerized_overlay_mount_status:-999} |
+| containerized fuse-overlayfs status | ${containerized_fuse_overlayfs_status:-999} |
+| containerized rofs status | ${containerized_rofs_status:-999} (${containerized_rofs_error_kind:-unknown}) |
+| containerized overlay status | ${containerized_overlay_status:-999} (${containerized_overlay_error_kind:-unknown}) |
+| containerized combined status | ${containerized_combined_status:-999} (${containerized_combined_error_kind:-unknown}) |
+| containerized runtime status | ${containerized_runtime_status:-999} (${containerized_runtime_error_kind:-unknown}) |
 
 Artifacts to inspect:
 
@@ -358,6 +419,11 @@ Artifacts to inspect:
 - target/ci-logs/strict_combined_sudo.log
 - target/ci-logs/strict_runtime_nonsudo.log
 - target/ci-logs/strict_runtime_sudo.log
+- target/ci-logs/container_probe.log
+- target/ci-logs/container_strict_rofs.log
+- target/ci-logs/container_strict_overlay.log
+- target/ci-logs/container_strict_combined.log
+- target/ci-logs/container_strict_runtime.log
 MD
 
 cat "$summary_md"
