@@ -1,0 +1,159 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_strict_fs:
+        description: Run strict filesystem capability probe
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      fail_on_environment_limit:
+        description: Fail if GitHub-hosted runner cannot prove Level 4
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      runner_label:
+        description: Runner label to use for Linux jobs
+        required: false
+        default: ubuntu-24.04
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Needed so pinned actions can read repository contents.
+permissions:
+  contents: read
+
+jobs:
+  rust-default:
+    name: Level 0 rust default
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Run default checks
+        run: scripts/ci/run-default-checks.sh
+
+  rofs-mount-free:
+    name: Level 1 rofs mount-free
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Run focused mount-free tests
+        run: |
+          cargo test -p kage-rofs --all-features -- --nocapture
+          cargo test -p kage-cli --all-features -- --nocapture
+          cargo test -p kage-core --all-features -- --nocapture
+
+  fs-capability-probe:
+    name: Level 2-4 fs capability probe
+    needs: [rust-default, rofs-mount-free]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_strict_fs == 'true' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    env:
+      FAIL_ON_ENVIRONMENT_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_environment_limit || 'false' }}
+      STRICT_TEST_TIMEOUT_SECONDS: 90
+      KAGE_PROOF_ROUTE: host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Probe GitHub-hosted filesystem capabilities
+        run: scripts/ci/probe-github-hosted-fs.sh
+      - name: Run strict filesystem tests without allow-skip
+        run: scripts/ci/run-strict-fs-tests.sh
+      - name: Classify strict filesystem proof
+        run: scripts/ci/write-proof-summary.sh
+      - name: Upload CI proof artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kage-ci-proof-${{ github.job }}
+          path: |
+            target/ci-proof/**
+            target/ci-logs/**
+          if-no-files-found: error
+
+  fs-capability-probe-containerized:
+    name: Level 2-4 fs capability probe containerized
+    needs: [rust-default, rofs-mount-free]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_strict_fs == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FAIL_ON_ENVIRONMENT_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_environment_limit || 'false' }}
+      STRICT_TEST_TIMEOUT_SECONDS: 90
+      KAGE_PROOF_ROUTE: containerized
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Run privileged container strict filesystem tests
+        run: scripts/ci/run-containerized-strict-fs-tests.sh
+      - name: Classify containerized strict filesystem proof
+        run: scripts/ci/write-proof-summary.sh
+      - name: Upload containerized CI proof artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kage-ci-proof-${{ github.job }}
+          path: |
+            target/ci-proof/**
+            target/ci-logs/**
+          if-no-files-found: error
+
+  gha-lint:
+    name: gha lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+  zizmor:
+    name: gha zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install zizmor
+        run: python3 -m pip install --user zizmor
+      - name: Run zizmor
+        run: ~/.local/bin/zizmor --persona pedantic .
