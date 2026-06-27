@@ -113,6 +113,16 @@ if getenv("fuse_overlayfs_available") == "true" and as_int("fuse_overlayfs_rootl
 
 permission_re = re.compile(r"Operation not permitted|permission denied|must be superuser|CAP_SYS_ADMIN|mount failed", re.I)
 setup_re = re.compile(r"sudo: .*cargo: command not found|No such file or directory.*cargo|rustup: command not found", re.I)
+git_index_conflict_re = re.compile(r"appears as both a file and as a directory|cannot add to the index|git update-index", re.I)
+rofs_einval_re = re.compile(r"kage-rofs fuse mount failed:.*Invalid argument|direct FUSE mount returned EINVAL|os error 22", re.I)
+capable_overlay_failed = as_int("overlay_sudo_mount_status") == 0 and attempted("strict_overlay_sudo") and not passed("strict_overlay_sudo")
+capable_rofs_failed = (
+    getenv("dev_fuse_exists") == "true"
+    and getenv("dev_fuse_rw") == "true"
+    and (getenv("sudo_has_cap_sys_admin") == "true" or getenv("fusermount3_available") == "true")
+    and attempted("strict_rofs_sudo")
+    and not passed("strict_rofs_sudo")
+)
 
 classification = "implementation_failure"
 classification_detail = "strict tests failed for an unclassified reason"
@@ -152,6 +162,14 @@ elif setup_re.search(text):
     classification = "setup_defect"
     classification_detail = "sudo strict route could not run cargo/toolchain; CI harness needs setup fixes"
     terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
+elif capable_overlay_failed and git_index_conflict_re.search(text):
+    classification = "implementation_failure"
+    classification_detail = "sudo overlay substrate passed, but strict overlay failed with a Git index file/directory conflict"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif capable_rofs_failed and rofs_einval_re.search(text):
+    classification = "implementation_failure"
+    classification_detail = "sudo/CAP_SYS_ADMIN rofs route was available, but direct kage-rofs FUSE mount returned EINVAL"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
 elif permission_re.search(text) and (privileged_route_attempted or helper_or_priv_probe_attempted):
     classification = "environment_unsupported"
     classification_detail = "strict filesystem proof failed after non-sudo and privileged/helper routes were attempted"
@@ -214,7 +232,9 @@ summary = {
     "fuse_overlayfs_rootless_status": as_int("fuse_overlayfs_rootless_status"),
     "fuse_overlayfs_sudo_status": as_int("fuse_overlayfs_sudo_status"),
     "kage_rofs_non_sudo_mount_status": as_int("kage_rofs_non_sudo_mount_status"),
+    "kage_rofs_non_sudo_mount_error_kind": getenv("kage_rofs_non_sudo_mount_error_kind"),
     "kage_rofs_sudo_mount_status": as_int("kage_rofs_sudo_mount_status"),
+    "kage_rofs_sudo_mount_error_kind": getenv("kage_rofs_sudo_mount_error_kind"),
     "strict_results": {
         "rofs": as_int("strict_rofs_status"),
         "overlay": as_int("strict_overlay_status"),
@@ -303,6 +323,8 @@ cat > "$summary_md" <<MD
 | overlay sudo mount status | ${overlay_sudo_mount_status:-999} |
 | fuse-overlayfs rootless status | ${fuse_overlayfs_rootless_status:-999} |
 | fuse-overlayfs sudo status | ${fuse_overlayfs_sudo_status:-999} |
+| kage-rofs non-sudo mount status | ${kage_rofs_non_sudo_mount_status:-999} (${kage_rofs_non_sudo_mount_error_kind:-unknown}) |
+| kage-rofs sudo mount status | ${kage_rofs_sudo_mount_status:-999} (${kage_rofs_sudo_mount_error_kind:-unknown}) |
 | strict rofs status | ${strict_rofs_status:-999} |
 | strict overlay status | ${strict_overlay_status:-999} |
 | strict combined status | ${strict_combined_status:-999} |

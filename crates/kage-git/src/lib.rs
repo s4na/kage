@@ -224,6 +224,7 @@ impl GitRepo {
             } else {
                 continue;
             };
+            remove_index_conflicts(&git_dir, &index, &rel)?;
             index_run(
                 &git_dir,
                 &index,
@@ -468,6 +469,51 @@ fn validate_rel(path: &Path) -> Result<()> {
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
+fn remove_index_conflicts(git_dir: &Path, index: &Path, path: &Path) -> Result<()> {
+    // If an upper entry replaces a parent directory with a file/symlink, remove
+    // every existing descendant first. Git's index cannot contain both `dir`
+    // and `dir/sub/file.txt`.
+    let descendant_prefix = format!("{}/", path_arg(path));
+    let descendants = index_output(
+        git_dir,
+        index,
+        &["ls-files", "-z", "--", &descendant_prefix],
+    )?;
+    for descendant in descendants.split('\0').filter(|p| !p.is_empty()) {
+        index_run(
+            git_dir,
+            index,
+            &["update-index", "--force-remove", descendant],
+        )?;
+    }
+
+    // If an upper entry adds a nested path below a file from the parent tree,
+    // remove the ancestor file before adding the nested entry.
+    let mut ancestor = PathBuf::new();
+    for component in path.components() {
+        ancestor.push(component.as_os_str());
+        if ancestor == path {
+            break;
+        }
+        index_run(
+            git_dir,
+            index,
+            &[
+                "update-index",
+                "--force-remove",
+                path_arg(&ancestor).as_str(),
+            ],
+        )?;
+    }
+
+    // Replacing a file with a file/symlink is also delete + add.
+    index_run(
+        git_dir,
+        index,
+        &["update-index", "--force-remove", path_arg(path).as_str()],
+    )?;
+    Ok(())
+}
 fn temp_index() -> PathBuf {
     std::env::temp_dir().join(format!(
         "kage-index-{}-{:?}",
@@ -590,6 +636,70 @@ mod tests {
             .unwrap();
         assert!(binary.status.success());
         assert_eq!(binary.stdout, vec![0, 159, 146, 150, 255]);
+        fs::remove_dir_all(repo_dir).unwrap();
+        fs::remove_dir_all(upper).unwrap();
+    }
+
+    #[test]
+    fn tree_from_layer_replaces_parent_directory_with_file() {
+        let (repo_dir, repo) = repo();
+        fs::create_dir_all(repo_dir.join("dir/sub")).unwrap();
+        fs::write(repo_dir.join("dir/sub/file.txt"), "parent").unwrap();
+        run_at(&repo_dir, "git", &["add", "dir/sub/file.txt"]).unwrap();
+        run_at(&repo_dir, "git", &["commit", "-m", "parent-dir"]).unwrap();
+        let parent = repo.rev_parse("refs/heads/main").unwrap();
+        let upper = temp("upper-dir-to-file");
+        fs::create_dir_all(&upper).unwrap();
+        fs::write(upper.join("dir"), "replacement file").unwrap();
+
+        let tree = repo.tree_from_layer(&parent, &upper).unwrap();
+
+        assert_eq!(
+            output_at(&repo_dir, "git", &["show", &format!("{tree}:dir")]).unwrap(),
+            "replacement file"
+        );
+        assert!(output_at(
+            &repo_dir,
+            "git",
+            &["cat-file", "-e", &format!("{tree}:dir/sub/file.txt")]
+        )
+        .is_err());
+        fs::remove_dir_all(repo_dir).unwrap();
+        fs::remove_dir_all(upper).unwrap();
+    }
+
+    #[test]
+    fn tree_from_layer_replaces_parent_file_with_directory() {
+        let (repo_dir, repo) = repo();
+        fs::write(repo_dir.join("dir"), "parent file").unwrap();
+        run_at(&repo_dir, "git", &["add", "dir"]).unwrap();
+        run_at(&repo_dir, "git", &["commit", "-m", "parent-file"]).unwrap();
+        let parent = repo.rev_parse("refs/heads/main").unwrap();
+        let upper = temp("upper-file-to-dir");
+        fs::create_dir_all(upper.join("dir/sub")).unwrap();
+        fs::write(upper.join("dir/sub/file.txt"), "nested replacement").unwrap();
+
+        let tree = repo.tree_from_layer(&parent, &upper).unwrap();
+
+        assert_eq!(
+            output_at(
+                &repo_dir,
+                "git",
+                &["cat-file", "-t", &format!("{tree}:dir")]
+            )
+            .unwrap()
+            .trim(),
+            "tree"
+        );
+        assert_eq!(
+            output_at(
+                &repo_dir,
+                "git",
+                &["show", &format!("{tree}:dir/sub/file.txt")]
+            )
+            .unwrap(),
+            "nested replacement"
+        );
         fs::remove_dir_all(repo_dir).unwrap();
         fs::remove_dir_all(upper).unwrap();
     }

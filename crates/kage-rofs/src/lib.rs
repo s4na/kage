@@ -734,11 +734,8 @@ unsafe fn mount_fuse(fd: RawFd, mountpoint: &Path) -> Result<()> {
     let source = CString::new("kage-rofs")?;
     let target = CString::new(mountpoint.as_os_str().as_bytes())?;
     let fstype = CString::new("fuse")?;
-    let opts = CString::new(format!(
-        "fd={fd},rootmode=40000,user_id={},group_id={},default_permissions,ro,fsname=kage-rofs,subtype=kage-rofs",
-        getuid(),
-        getgid()
-    ))?;
+    let opts_string = fuse_mount_options(fd);
+    let opts = CString::new(opts_string.as_str())?;
     let rc = c_mount(
         source.as_ptr(),
         target.as_ptr(),
@@ -749,12 +746,35 @@ unsafe fn mount_fuse(fd: RawFd, mountpoint: &Path) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
+        let err = std::io::Error::last_os_error();
+        let kind = match err.raw_os_error() {
+            Some(1) => "kernel denied direct FUSE mount (EPERM); CAP_SYS_ADMIN or fusermount3 helper may be required",
+            Some(13) => "/dev/fuse or mountpoint permission denied (EACCES)",
+            Some(22) => "direct FUSE mount returned EINVAL; kage-rofs mount options may be incompatible with this kernel",
+            _ => "direct FUSE mount failed",
+        };
         Err(format!(
-            "kage-rofs fuse mount failed: {}; /dev/fuse and CAP_SYS_ADMIN or a mount helper are required",
-            std::io::Error::last_os_error()
+            "kage-rofs fuse mount failed: {err}; context: source=kage-rofs fstype=fuse target={} flags=MS_NOSUID|MS_NODEV|MS_RDONLY option_keys={} error_kind={kind}",
+            mountpoint.display(),
+            fuse_mount_option_keys(&opts_string).join(",")
         )
         .into())
     }
+}
+
+fn fuse_mount_options(fd: RawFd) -> String {
+    format!(
+        "fd={fd},rootmode=040000,user_id={},group_id={},default_permissions,ro,fsname=kage-rofs,subtype=kage-rofs",
+        unsafe { getuid() },
+        unsafe { getgid() }
+    )
+}
+
+fn fuse_mount_option_keys(options: &str) -> Vec<&str> {
+    options
+        .split(',')
+        .map(|option| option.split_once('=').map_or(option, |(key, _)| key))
+        .collect()
 }
 
 fn unmount_path(path: &Path) -> Result<()> {
@@ -1166,6 +1186,22 @@ mod tests {
         assert!(names.contains(&"file-00.txt".to_string()));
         assert!(names.contains(&"file-63.txt".to_string()));
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn fuse_mount_options_are_kernel_context_diagnostic_friendly() {
+        let options = fuse_mount_options(42);
+        let keys = fuse_mount_option_keys(&options);
+        assert!(options.contains("fd=42"));
+        assert!(options.contains("rootmode=040000"));
+        assert!(options.contains("default_permissions"));
+        assert!(options.contains("ro"));
+        assert!(options.contains("fsname=kage-rofs"));
+        assert!(options.contains("subtype=kage-rofs"));
+        assert!(keys.contains(&"fd"));
+        assert!(keys.contains(&"rootmode"));
+        assert!(keys.contains(&"user_id"));
+        assert!(keys.contains(&"group_id"));
     }
 
     #[test]

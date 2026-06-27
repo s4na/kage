@@ -33,7 +33,7 @@ The filesystem probe uploads `kage-ci-proof-fs-capability-probe` containing:
 - `target/ci-logs/strict_runtime_nonsudo.log`
 - `target/ci-logs/strict_runtime_sudo.log`
 
-`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, `fusermount3` and `fuse-overlayfs` availability, sudo availability and capability hints, non-sudo and sudo overlay probes, rootless and sudo `fuse-overlayfs` probes, strict command exit codes, proof level reached, terminal classification, allow-skip status, attempted/passed/skipped booleans for every strict proof command including non-sudo/sudo routes, environment blockers, failing tests, artifact paths, and the workflow run URL when GitHub exposes it.
+`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, `fusermount3` and `fuse-overlayfs` availability, sudo availability and capability hints, non-sudo and sudo overlay probes, rootless and sudo `fuse-overlayfs` probes, direct kage-rofs non-sudo/sudo strict route statuses plus stable error-kind labels, strict command exit codes, proof level reached, terminal classification, allow-skip status, attempted/passed/skipped booleans for every strict proof command including non-sudo/sudo routes, environment blockers, failing tests, artifact paths, and the workflow run URL when GitHub exposes it.
 
 ## Interpreting outcomes
 
@@ -76,4 +76,4 @@ Paste back the workflow run URL plus `target/ci-proof/summary.json`, `target/ci-
 
 ## Classification note from run 28281744534
 
-A prior GitHub Actions artifact from `https://github.com/s4na/kage/actions/runs/28281744534` reported Level 1 and `STRONG_ENVIRONMENT_BLOCKED` even though `/dev/fuse`, passwordless `sudo`, `fuse3`, and `fuse-overlayfs` were available. That classification was too strong because the harness had not yet tried sudo/helper routes. New summaries should classify that shape as `LEVEL1_MOUNT_FREE_ONLY_PROVEN` unless the privileged/helper matrix has actually been exercised and failed for environment reasons.
+A prior GitHub Actions artifact from `https://github.com/s4na/kage/actions/runs/28281744534` reported Level 1 and `STRONG_ENVIRONMENT_BLOCKED` even though `/dev/fuse`, passwordless `sudo`, `fuse3`, and `fuse-overlayfs` were available. That classification was too strong because the harness had not yet tried sudo/helper routes. New summaries should classify that shape as `LEVEL1_MOUNT_FREE_ONLY_PROVEN` unless the privileged/helper matrix has actually been exercised and failed for environment reasons. If that matrix reaches a capable route (for example sudo overlay probe succeeds or sudo has `CAP_SYS_ADMIN`) and strict kage commands then fail with Git index conflicts or direct FUSE `EINVAL`, the summary must prefer `IMPLEMENTATION_BUG_WITH_REPRO` over `STRONG_ENVIRONMENT_BLOCKED`.

@@ -62,9 +62,30 @@ aggregate_status() {
     echo "${aggregate}_status=$sudo_status" >> "$results"
   fi
 }
+error_kind_from_log() {
+  local log="$1"
+  if grep -Eqi 'Invalid argument|os error 22|EINVAL' "$log"; then
+    printf '%s' direct_mount_einval
+  elif grep -Eqi 'Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN' "$log"; then
+    printf '%s' permission_denied
+  elif grep -Eqi '/dev/fuse is unavailable|No such file or directory.*/dev/fuse' "$log"; then
+    printf '%s' missing_dev_fuse
+  elif grep -Eqi 'appears as both a file and as a directory|cannot add to the index|git update-index' "$log"; then
+    printf '%s' git_index_conflict
+  else
+    printf '%s' unknown
+  fi
+}
+record_rofs_probe_statuses() {
+  echo "kage_rofs_non_sudo_mount_status=$(status_value strict_rofs_nonsudo_status)" >> "$results"
+  echo "kage_rofs_non_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_nonsudo.log)" >> "$results"
+  echo "kage_rofs_sudo_mount_status=$(status_value strict_rofs_sudo_status)" >> "$results"
+  echo "kage_rofs_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_sudo.log)" >> "$results"
+}
 
 run_case strict_rofs_nonsudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib -- --nocapture rofs_mount_strict_requires_real_read_only_mount
 run_sudo_case strict_rofs_sudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib -- --nocapture rofs_mount_strict_requires_real_read_only_mount
+record_rofs_probe_statuses
 aggregate_status strict_rofs strict_rofs_nonsudo_status strict_rofs_sudo_status
 
 run_case strict_overlay_nonsudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees -- --nocapture overlayfs_backend_tree_matches_fallback_tree_when_enabled

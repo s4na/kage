@@ -21,7 +21,7 @@ command_status() {
   printf '%s' "$status"
 }
 has_cap_sys_admin() {
-  grep -Eq 'Current:.*cap_sys_admin|Current:.*=ep|Current:.*=eip' <<< "$1" && echo true || echo false
+  grep -Eq '^Current:.*cap_sys_admin([,= ]|$)' <<< "$1" && echo true || echo false
 }
 
 : > "$env_file"
@@ -172,6 +172,8 @@ record fuse_overlayfs_sudo_status "$fuse_overlayfs_sudo_status"
 # The strict matrix measures the kage-rofs mount path. Keep explicit probe
 # fields for summary compatibility without duplicating expensive cargo tests.
 record kage_rofs_non_sudo_mount_status 999
+record kage_rofs_non_sudo_mount_error_kind not_attempted
 record kage_rofs_sudo_mount_status 999
+record kage_rofs_sudo_mount_error_kind not_attempted
 
 cat "$env_file" | tee -a "$log"
