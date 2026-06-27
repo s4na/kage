@@ -292,14 +292,16 @@ pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMo
         return Err("/dev/fuse is unavailable; cannot mount kage-rofs".into());
     }
     fs::create_dir_all(mountpoint)?;
-    let fd = unsafe { open_fuse()? };
-    let mounted = unsafe { mount_fuse(fd, mountpoint) };
-    if let Err(err) = mounted {
-        unsafe {
-            close_fd(fd);
-        }
-        return Err(err);
-    }
+    let fd = match mount_fuse_direct(mountpoint) {
+        Ok(fd) => fd,
+        Err(direct_err) if fusermount3_available() => mount_fuse_with_fusermount3(mountpoint)
+            .map_err(|helper_err| {
+                format!(
+                    "kage-rofs fuse mount failed via direct mount and fusermount3 helper; direct_error={direct_err}; helper_error={helper_err}"
+                )
+            })?,
+        Err(err) => return Err(err),
+    };
     let server = FuseServer::new(view.clone());
     let worker_fd = fd;
     let worker = thread::spawn(move || server.serve(worker_fd));
@@ -308,6 +310,17 @@ pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMo
         fd,
         worker: Some(worker),
     })
+}
+
+fn mount_fuse_direct(mountpoint: &Path) -> Result<RawFd> {
+    let fd = unsafe { open_fuse()? };
+    if let Err(err) = unsafe { mount_fuse(fd, mountpoint) } {
+        unsafe {
+            close_fd(fd);
+        }
+        return Err(err);
+    }
+    Ok(fd)
 }
 
 #[derive(Clone)]
@@ -777,11 +790,137 @@ fn fuse_mount_option_keys(options: &str) -> Vec<&str> {
         .collect()
 }
 
+fn fusermount3_available() -> bool {
+    Command::new("fusermount3")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn fusermount3_options() -> String {
+    "ro,nosuid,nodev,default_permissions,fsname=kage-rofs,subtype=kage-rofs".to_string()
+}
+
+fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
+    let mut fds = [0; 2];
+    if unsafe { socketpair(AF_UNIX, SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "fusermount3 socketpair failed: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    unsafe {
+        let _ = c_fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+    let commfd = fds[0].to_string();
+    let output = Command::new("fusermount3")
+        .env("_FUSE_COMMFD", &commfd)
+        .arg("-o")
+        .arg(fusermount3_options())
+        .arg("--")
+        .arg(mountpoint)
+        .output();
+    unsafe {
+        close_fd(fds[0]);
+    }
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            unsafe {
+                close_fd(fds[1]);
+            }
+            return Err(format!("failed to spawn fusermount3 helper: {err}").into());
+        }
+    };
+    let fd = unsafe { receive_fd(fds[1]) };
+    unsafe {
+        close_fd(fds[1]);
+    }
+    if output.status.success() && fd >= 0 {
+        unsafe {
+            let _ = c_fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        Ok(fd)
+    } else {
+        if fd >= 0 {
+            unsafe {
+                close_fd(fd);
+            }
+        }
+        Err(format!(
+            "fusermount3 failed status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
+unsafe fn receive_fd(socket: RawFd) -> RawFd {
+    let mut byte = [0_u8; 1];
+    let mut iov = Iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let mut control = [0_u8; CMSG_SPACE_I32];
+    let mut msg = Msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr().cast(),
+        msg_controllen: control.len(),
+        msg_flags: 0,
+    };
+    let received = recvmsg(socket, &mut msg, 0);
+    if received <= 0 {
+        return -1;
+    }
+    let cmsg = msg.msg_control.cast::<Cmsghdr>();
+    if cmsg.is_null()
+        || (*cmsg).cmsg_level != SOL_SOCKET
+        || (*cmsg).cmsg_type != SCM_RIGHTS
+        || (*cmsg).cmsg_len < CMSG_LEN_I32
+    {
+        return -1;
+    }
+    let data = (cmsg.cast::<u8>()).add(cmsg_align(std::mem::size_of::<Cmsghdr>()));
+    *(data.cast::<i32>())
+}
+
+const fn cmsg_align(len: usize) -> usize {
+    (len + std::mem::size_of::<usize>() - 1) & !(std::mem::size_of::<usize>() - 1)
+}
+
+const CMSG_LEN_I32: usize = cmsg_align(std::mem::size_of::<Cmsghdr>()) + std::mem::size_of::<i32>();
+const CMSG_SPACE_I32: usize = cmsg_align(CMSG_LEN_I32);
+
 fn unmount_path(path: &Path) -> Result<()> {
     let target = CString::new(path.as_os_str().as_bytes())?;
     let rc = unsafe { c_umount2(target.as_ptr(), MNT_DETACH) };
     if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(EINVAL) {
         Ok(())
+    } else if fusermount3_available() {
+        let output = Command::new("fusermount3")
+            .arg("--unmount")
+            .arg("--quiet")
+            .arg("--lazy")
+            .arg("--")
+            .arg(path)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "umount2 and fusermount3 unmount failed: umount2_error={}; fusermount3_status={} stderr={}",
+                std::io::Error::last_os_error(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
+        }
     } else {
         Err(std::io::Error::last_os_error().into())
     }
@@ -806,6 +945,12 @@ const MS_NOSUID: usize = 2;
 const MS_NODEV: usize = 4;
 const MNT_DETACH: i32 = 2;
 const EINVAL: i32 = 22;
+const AF_UNIX: i32 = 1;
+const SOCK_STREAM: i32 = 1;
+const SOL_SOCKET: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
 const ENOENT: i32 = 2;
 const ENOSYS: i32 = 38;
 const ENOTDIR: i32 = 20;
@@ -842,6 +987,30 @@ const FUSE_CREATE: u32 = 35;
 const FUSE_IN_HEADER_SIZE: usize = 40;
 const FUSE_DIRENT_SIZE: usize = 24;
 
+#[repr(C)]
+struct Iovec {
+    iov_base: *mut std::ffi::c_void,
+    iov_len: usize,
+}
+
+#[repr(C)]
+struct Msghdr {
+    msg_name: *mut std::ffi::c_void,
+    msg_namelen: u32,
+    msg_iov: *mut Iovec,
+    msg_iovlen: usize,
+    msg_control: *mut std::ffi::c_void,
+    msg_controllen: usize,
+    msg_flags: i32,
+}
+
+#[repr(C)]
+struct Cmsghdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+
 unsafe extern "C" {
     fn open(path: *const i8, flags: i32, mode: u32) -> i32;
     fn close(fd: i32) -> i32;
@@ -855,6 +1024,9 @@ unsafe extern "C" {
         data: *const std::ffi::c_void,
     ) -> i32;
     fn umount2(target: *const i8, flags: i32) -> i32;
+    fn socketpair(domain: i32, kind: i32, protocol: i32, sv: *mut i32) -> i32;
+    fn recvmsg(sockfd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn getuid() -> u32;
     fn getgid() -> u32;
 }
@@ -882,6 +1054,9 @@ unsafe fn c_mount(
 }
 unsafe fn c_umount2(target: *const i8, flags: i32) -> i32 {
     umount2(target, flags)
+}
+unsafe fn c_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
+    fcntl(fd, cmd, arg)
 }
 
 #[cfg(test)]
@@ -1202,6 +1377,19 @@ mod tests {
         assert!(keys.contains(&"rootmode"));
         assert!(keys.contains(&"user_id"));
         assert!(keys.contains(&"group_id"));
+    }
+
+    #[test]
+    fn fusermount3_options_are_read_only_and_do_not_include_direct_fd() {
+        let options = fusermount3_options();
+        assert!(options.contains("ro"));
+        assert!(options.contains("nosuid"));
+        assert!(options.contains("nodev"));
+        assert!(options.contains("default_permissions"));
+        assert!(options.contains("fsname=kage-rofs"));
+        assert!(options.contains("subtype=kage-rofs"));
+        assert!(!options.contains("fd="));
+        assert!(!options.contains("rootmode="));
     }
 
     #[test]
