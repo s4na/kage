@@ -2,6 +2,14 @@
 set -euo pipefail
 
 mkdir -p target/ci-proof target/ci-logs
+for log in \
+  target/ci-logs/container_probe.log \
+  target/ci-logs/container_strict_rofs.log \
+  target/ci-logs/container_strict_overlay.log \
+  target/ci-logs/container_strict_combined.log \
+  target/ci-logs/container_strict_runtime.log; do
+  : > "$log"
+done
 container_env=target/ci-proof/container.env
 : > "$container_env"
 STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
@@ -19,7 +27,15 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 echo "containerized_docker_available=true" >> "$container_env"
 
+set +e
 docker build -f "$DOCKERFILE" -t "$IMAGE" . 2>&1 | tee target/ci-logs/container_image_build.log
+build_status=${PIPESTATUS[0]}
+set -e
+echo "containerized_image_build_status=$build_status" >> "$container_env"
+if [ "$build_status" -ne 0 ]; then
+  echo "container strict image build failed with status $build_status; see target/ci-logs/container_image_build.log" | tee -a target/ci-logs/container_probe.log
+  exit 0
+fi
 
 container_payload='set -euo pipefail
 mkdir -p /out/logs /out/proof /work/kage
