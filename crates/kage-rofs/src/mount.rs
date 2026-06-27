@@ -89,13 +89,19 @@ impl RofsMount {
     }
 
     fn unmount_inner(&mut self) -> Result<()> {
-        let mountpoint = self.mountpoint().to_path_buf();
-        let unmount_result = unmount_path(&mountpoint);
         match self {
             Self::Fuser { session, .. } => {
-                drop(session.take());
+                if let Some(session) = session.take() {
+                    session.umount_and_join()?;
+                }
+                Ok(())
             }
-            Self::Handwritten { fd, worker, .. } => {
+            Self::Handwritten {
+                mountpoint,
+                fd,
+                worker,
+            } => {
+                let unmount_result = unmount_path(mountpoint);
                 unsafe {
                     close_fd(*fd);
                 }
@@ -103,9 +109,9 @@ impl RofsMount {
                 if let Some(worker) = worker.take() {
                     let _ = worker.join();
                 }
+                unmount_result
             }
         }
-        unmount_result
     }
 }
 
