@@ -156,6 +156,7 @@ classification_detail = "strict tests failed for an unclassified reason"
 terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
 proof_level = 1
 strict_proof_obtained = False
+proof_route_scope = getenv("KAGE_PROOF_ROUTE", "auto")
 
 if allow_skip_used:
     classification_detail = "allow-skip variable was set in a strict proof job"
@@ -287,6 +288,7 @@ summary = {
     },
     "proof_level_reached": proof_level,
     "terminal_classification": terminal_classification,
+    "proof_route_scope": proof_route_scope,
     "allow_skip_used": allow_skip_used,
     "strict_proof_obtained": strict_proof_obtained,
     "strict_rofs_attempted": strict_rofs_attempted,
@@ -369,6 +371,8 @@ cat > "$summary_md" <<MD
 **Classification:** ${classification}
 **Terminal classification:** ${terminal_classification}
 **Detail:** ${classification_detail}
+**Route scope:** ${KAGE_PROOF_ROUTE:-auto}
+**Exit behavior:** implementation and setup defects intentionally exit non-zero after writing artifacts.
 **Proof level reached:** Level ${proof_level}
 **Allow-skip used:** ${allow_skip_used:-false}
 **Strict proof obtained:** ${strict_proof_obtained}
@@ -405,6 +409,8 @@ cat > "$summary_md" <<MD
 | containerized overlay status | ${containerized_overlay_status:-999} (${containerized_overlay_error_kind:-unknown}) |
 | containerized combined status | ${containerized_combined_status:-999} (${containerized_combined_error_kind:-unknown}) |
 | containerized runtime status | ${containerized_runtime_status:-999} (${containerized_runtime_error_kind:-unknown}) |
+
+If this is the host-route artifact, containerized fields are expected to be unknown/999; inspect the separate kage-ci-proof-fs-capability-probe-containerized artifact for the privileged-container route.
 
 Artifacts to inspect:
 

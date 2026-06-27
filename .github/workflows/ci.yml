@@ -77,6 +77,7 @@ jobs:
     env:
       FAIL_ON_ENVIRONMENT_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_environment_limit || 'false' }}
       STRICT_TEST_TIMEOUT_SECONDS: 90
+      KAGE_PROOF_ROUTE: host
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -111,6 +112,7 @@ jobs:
     env:
       FAIL_ON_ENVIRONMENT_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_environment_limit || 'false' }}
       STRICT_TEST_TIMEOUT_SECONDS: 90
+      KAGE_PROOF_ROUTE: containerized
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
