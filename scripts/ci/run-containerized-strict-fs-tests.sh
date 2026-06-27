@@ -47,9 +47,11 @@ record containerized_strict_attempted true
 record containerized_privileged_attempted true
 record containerized_strict_image "${KAGE_CONTAINER_STRICT_IMAGE:-unknown}"
 status_value=999
+zero_test_log() { grep -Eq "running 0 tests|0 passed; 0 failed; .*filtered out" "$1"; }
 error_kind_from_log() {
   local log="$1"
-  if grep -Eqi "fuser_backend_unavailable|fuser_mount_error" "$log"; then echo fuser_backend_failure
+  if zero_test_log "$log"; then echo strict_test_filter_matched_zero_tests
+  elif grep -Eqi "fuser_backend_unavailable|fuser_mount_error" "$log"; then echo fuser_backend_failure
   elif grep -Eqi "Invalid argument|os error 22|EINVAL" "$log"; then echo direct_mount_einval
   elif grep -Eqi "/dev/fuse is unavailable|No such file or directory.*/dev/fuse" "$log"; then echo missing_dev_fuse
   elif grep -Eqi "timed out|timeout|Command exited with non-zero status 124" "$log"; then echo timeout
@@ -68,6 +70,10 @@ run_strict() {
   local st=$?
   set -e
   record "containerized_${name}_attempted" true
+  if [ "$st" -eq 0 ] && zero_test_log "$log"; then
+    st=2
+    echo "container ${name} zero-test false positive converted to failure" | tee -a "$log"
+  fi
   record "containerized_${name}_status" "$st"
   if [ "$st" -eq 0 ]; then
     record "containerized_${name}_passed" true
@@ -116,10 +122,10 @@ tar -C /src --exclude=target -cf - . | tar -C /work/kage -xf -
 cd /work/kage
 cargo --version | tee -a /out/logs/container_probe.log
 rustc --version | tee -a /out/logs/container_probe.log
-run_strict rofs env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser cargo test -p kage-rofs --lib tests::rofs_mount_strict_requires_real_read_only_mount -- --exact --nocapture --test-threads=1
+run_strict rofs env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
 run_strict overlay env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict combined env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict runtime env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_strict combined env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_strict runtime env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
 cat /out/proof/container.env
 '
 

@@ -43,8 +43,40 @@ def attempted(name):
 def skipped(_name):
     return as_bool("allow_skip_used")
 
+zero_test_re = re.compile(r"running 0 tests|0 passed; 0 failed; .*filtered out", re.I)
+LOG_BY_NAME = {
+    "strict_rofs_nonsudo": "target/ci-logs/strict_rofs_nonsudo.log",
+    "strict_rofs_sudo": "target/ci-logs/strict_rofs_sudo.log",
+    "strict_overlay_nonsudo": "target/ci-logs/strict_overlay_nonsudo.log",
+    "strict_overlay_sudo": "target/ci-logs/strict_overlay_sudo.log",
+    "strict_combined_nonsudo": "target/ci-logs/strict_combined_nonsudo.log",
+    "strict_combined_sudo": "target/ci-logs/strict_combined_sudo.log",
+    "strict_runtime_nonsudo": "target/ci-logs/strict_runtime_nonsudo.log",
+    "strict_runtime_sudo": "target/ci-logs/strict_runtime_sudo.log",
+    "containerized_rofs": "target/ci-logs/container_strict_rofs.log",
+    "containerized_overlay": "target/ci-logs/container_strict_overlay.log",
+    "containerized_combined": "target/ci-logs/container_strict_combined.log",
+    "containerized_runtime": "target/ci-logs/container_strict_runtime.log",
+}
+LOG_GROUPS = {
+    "strict_rofs": ["strict_rofs_nonsudo", "strict_rofs_sudo"],
+    "strict_overlay": ["strict_overlay_nonsudo", "strict_overlay_sudo"],
+    "strict_combined": ["strict_combined_nonsudo", "strict_combined_sudo"],
+    "strict_runtime": ["strict_runtime_nonsudo", "strict_runtime_sudo"],
+}
+def log_has_zero_tests(name):
+    if name in LOG_GROUPS:
+        return any(log_has_zero_tests(member) for member in LOG_GROUPS[name])
+    log_path = LOG_BY_NAME.get(name)
+    if not log_path:
+        return False
+    path = Path(log_path)
+    if not path.is_file():
+        return False
+    return bool(zero_test_re.search(path.read_text(encoding="utf-8", errors="replace")))
+
 def passed(name):
-    return attempted(name) and status(name) == 0 and not skipped(name)
+    return attempted(name) and status(name) == 0 and not skipped(name) and not log_has_zero_tests(name)
 
 def any_pass(*names):
     return any(passed(name) for name in names)
@@ -70,13 +102,13 @@ strict_combined_attempted = any_attempt("strict_combined_nonsudo", "strict_combi
 strict_runtime_attempted = any_attempt("strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime")
 containerized_strict_attempted = as_bool("containerized_strict_attempted")
 containerized_rofs_attempted = as_bool("containerized_rofs_attempted") or as_int("containerized_rofs_status") != 999
-containerized_rofs_passed = containerized_rofs_attempted and as_int("containerized_rofs_status") == 0 and not allow_skip_used
+containerized_rofs_passed = containerized_rofs_attempted and as_int("containerized_rofs_status") == 0 and not allow_skip_used and not log_has_zero_tests("containerized_rofs")
 containerized_overlay_attempted = as_bool("containerized_overlay_attempted") or as_int("containerized_overlay_status") != 999
-containerized_overlay_passed = containerized_overlay_attempted and as_int("containerized_overlay_status") == 0 and not allow_skip_used
+containerized_overlay_passed = containerized_overlay_attempted and as_int("containerized_overlay_status") == 0 and not allow_skip_used and not log_has_zero_tests("containerized_overlay")
 containerized_combined_attempted = as_bool("containerized_combined_attempted") or as_int("containerized_combined_status") != 999
-containerized_combined_passed = containerized_combined_attempted and as_int("containerized_combined_status") == 0 and not allow_skip_used
+containerized_combined_passed = containerized_combined_attempted and as_int("containerized_combined_status") == 0 and not allow_skip_used and not log_has_zero_tests("containerized_combined")
 containerized_runtime_attempted = as_bool("containerized_runtime_attempted") or as_int("containerized_runtime_status") != 999
-containerized_runtime_passed = containerized_runtime_attempted and as_int("containerized_runtime_status") == 0 and not allow_skip_used
+containerized_runtime_passed = containerized_runtime_attempted and as_int("containerized_runtime_status") == 0 and not allow_skip_used and not log_has_zero_tests("containerized_runtime")
 containerized_any_attempted = any([containerized_rofs_attempted, containerized_overlay_attempted, containerized_combined_attempted, containerized_runtime_attempted])
 containerized_any_failed = any([
     containerized_rofs_attempted and not containerized_rofs_passed,
@@ -105,10 +137,14 @@ for name in [
     "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined",
     "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime",
 ]:
-    if attempted(name) and status(name) != 0:
+    if attempted(name) and log_has_zero_tests(name):
+        failing_tests.append(f"{name}_zero_tests")
+    elif attempted(name) and status(name) != 0:
         failing_tests.append(name)
 for name in ["rofs", "overlay", "combined", "runtime"]:
-    if as_bool(f"containerized_{name}_attempted") and as_int(f"containerized_{name}_status") != 0:
+    if as_bool(f"containerized_{name}_attempted") and log_has_zero_tests(f"containerized_{name}"):
+        failing_tests.append(f"containerized_{name}_zero_tests")
+    elif as_bool(f"containerized_{name}_attempted") and as_int(f"containerized_{name}_status") != 0:
         failing_tests.append(f"containerized_{name}")
 
 environment_blockers = []
@@ -160,7 +196,11 @@ proof_level = 1
 strict_proof_obtained = False
 proof_route_scope = getenv("KAGE_PROOF_ROUTE", "auto")
 
-if allow_skip_used:
+if any(name.endswith("_zero_tests") for name in failing_tests):
+    classification = "setup_defect"
+    classification_detail = "strict proof command matched zero tests; CI harness rejected the false positive"
+    terminal_classification = "CI_HARNESS_FALSE_POSITIVE"
+elif allow_skip_used:
     classification_detail = "allow-skip variable was set in a strict proof job"
 elif strict_runtime_passed or containerized_runtime_passed:
     classification = "proof_passed"
@@ -317,6 +357,8 @@ summary = {
     "strict_rofs_nonsudo_passed": passed("strict_rofs_nonsudo"),
     "strict_rofs_sudo_attempted": attempted("strict_rofs_sudo"),
     "strict_rofs_sudo_passed": passed("strict_rofs_sudo"),
+    "strict_rofs_nonsudo_zero_tests": log_has_zero_tests("strict_rofs_nonsudo"),
+    "strict_rofs_sudo_zero_tests": log_has_zero_tests("strict_rofs_sudo"),
     "strict_overlay_attempted": strict_overlay_attempted,
     "strict_overlay_passed": strict_overlay_passed,
     "strict_overlay_skipped": skipped("strict_overlay"),
@@ -359,6 +401,7 @@ summary = {
     "containerized_fuse_overlayfs_status": as_int("containerized_fuse_overlayfs_status"),
     "containerized_rofs_attempted": containerized_rofs_attempted,
     "containerized_rofs_passed": containerized_rofs_passed,
+    "containerized_rofs_zero_tests": log_has_zero_tests("containerized_rofs"),
     "containerized_rofs_error_kind": getenv("containerized_rofs_error_kind"),
     "containerized_overlay_attempted": containerized_overlay_attempted,
     "containerized_overlay_passed": containerized_overlay_passed,

@@ -24,7 +24,7 @@ pub enum RofsBackend {
 impl RofsBackend {
     pub fn selected() -> Result<Self> {
         match std::env::var("KAGE_ROFS_BACKEND").ok().as_deref() {
-            None | Some("") => Ok(Self::Fuser),
+            None | Some("") => Ok(Self::Handwritten),
             Some("fuser") => Ok(Self::Fuser),
             Some("handwritten") => Ok(Self::Handwritten),
             Some(other) => Err(format!(
@@ -85,6 +85,10 @@ pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMo
     if backend == RofsBackend::Fuser {
         return fuser_backend::mount_rofs_fuser(view, mountpoint);
     }
+    mount_rofs_handwritten(view, mountpoint)
+}
+
+pub(crate) fn mount_rofs_handwritten(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMount> {
     if !rofs_mount_available() {
         return Err("/dev/fuse is unavailable; cannot mount kage-rofs".into());
     }
