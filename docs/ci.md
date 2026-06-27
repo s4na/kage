@@ -29,7 +29,7 @@ The filesystem probe uploads `kage-ci-proof-fs-capability-probe` containing:
 - `target/ci-logs/strict_combined.log`
 - `target/ci-logs/strict_runtime.log`
 
-`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, overlay availability, strict command exit codes, proof level reached, allow-skip status, and classification.
+`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, overlay availability, strict command exit codes, proof level reached, terminal classification, allow-skip status, attempted/passed/skipped booleans for every strict proof command, environment blockers, failing tests, artifact paths, and the workflow run URL when GitHub exposes it.
 
 ## Interpreting outcomes
 
@@ -50,3 +50,22 @@ The filesystem probe uploads `kage-ci-proof-fs-capability-probe` containing:
 - `runner_label`: runner label, default `ubuntu-24.04`.
 
 No self-hosted, larger, paid, or secret-backed runners are required by default.
+
+## Human runbook when local `gh` cannot run Actions
+
+From a checkout on the branch under review:
+
+```bash
+git push -u origin "$(git branch --show-current)"
+gh workflow run ci.yml --ref "$(git branch --show-current)" \
+  -f run_strict_fs=true \
+  -f fail_on_environment_limit=false \
+  -f runner_label=ubuntu-24.04
+gh run watch
+run_id="$(gh run list --workflow ci.yml --branch "$(git branch --show-current)" --limit 1 --json databaseId --jq '.[0].databaseId')"
+mkdir -p gha-artifacts
+gh run download "$run_id" --dir gha-artifacts
+find gha-artifacts -maxdepth 4 -type f | sort
+```
+
+Paste back the workflow run URL plus `target/ci-proof/summary.json`, `target/ci-proof/summary.md`, `target/ci-logs/fs-probe.log`, and any failing strict logs from the downloaded `kage-ci-proof-fs-capability-probe` artifact.
