@@ -4,88 +4,24 @@ set -euo pipefail
 mkdir -p target/ci-proof target/ci-logs
 summary_json=target/ci-proof/summary.json
 summary_md=target/ci-proof/summary.md
-: > /tmp/ci-env-combined.sh
-[ -f target/ci-proof/env.sh ] && cat target/ci-proof/env.sh >> /tmp/ci-env-combined.sh
-[ -f target/ci-proof/results.env ] && cat target/ci-proof/results.env >> /tmp/ci-env-combined.sh
-# shellcheck disable=SC1091
-source /tmp/ci-env-combined.sh || true
-
-strict_rofs_status=${strict_rofs_status:-999}
-strict_overlay_status=${strict_overlay_status:-999}
-strict_combined_status=${strict_combined_status:-999}
-strict_runtime_status=${strict_runtime_status:-999}
-apt_status=${apt_status:-999}
-allow_skip_used=${allow_skip_used:-false}
-
-env_text="$(cat target/ci-logs/*.log 2>/dev/null || true)"
-classification="implementation_failure"
-classification_detail="strict tests failed for an unclassified reason"
-proof_level=1
-strict_proof_obtained=false
-terminal_classification="IMPLEMENTATION_BUG_WITH_REPRO"
-
-if [[ "$allow_skip_used" == "true" ]]; then
-  classification="implementation_failure"
-  classification_detail="allow-skip variable was set in a strict proof job"
-  terminal_classification="IMPLEMENTATION_BUG_WITH_REPRO"
-elif [[ "$strict_runtime_status" == "0" ]]; then
-  classification="proof_passed"
-  classification_detail="Level 4 runtime smoke passed without allow-skip"
-  proof_level=4
-  strict_proof_obtained=true
-  terminal_classification="LEVEL4_RUNTIME_PROVEN"
-elif [[ "$strict_combined_status" == "0" ]]; then
-  classification="proof_passed"
-  classification_detail="Combined rofs+overlay strict tests passed, runtime smoke did not"
-  proof_level=3
-  strict_proof_obtained=true
-  terminal_classification="LEVEL3_OVERLAY_AND_LOWER_PROVEN_BUT_RUNTIME_NOT_PROVEN"
-elif [[ "$strict_rofs_status" == "0" && "$strict_overlay_status" == "0" ]]; then
-  classification="proof_passed"
-  classification_detail="Level 2 and Level 3 passed separately"
-  proof_level=3
-  strict_proof_obtained=true
-  terminal_classification="LEVEL3_OVERLAY_AND_LOWER_PROVEN_BUT_RUNTIME_NOT_PROVEN"
-elif [[ "$strict_rofs_status" == "0" ]]; then
-  classification="environment_unsupported"
-  classification_detail="Level 2 rofs passed, overlay/runtime did not pass; inspect overlay logs"
-  proof_level=2
-  terminal_classification="LEVEL2_ROFS_PROVEN_BUT_OVERLAY_OR_RUNTIME_NOT_PROVEN"
-elif [[ "$strict_overlay_status" == "0" ]]; then
-  classification="environment_unsupported"
-  classification_detail="Level 3 overlay passed, rofs/runtime did not pass; inspect rofs logs"
-  proof_level=3
-  terminal_classification="LEVEL3_OVERLAY_AND_LOWER_PROVEN_BUT_RUNTIME_NOT_PROVEN"
-elif grep -Eqi '/dev/fuse is unavailable|/dev/fuse unavailable|No such file or directory.*dev/fuse|fuse mount failed|CAP_SYS_ADMIN|permission denied|Operation not permitted|overlay mount failed|mount.*denied' <<< "$env_text"; then
-  classification="environment_unsupported"
-  classification_detail="strict filesystem proof did not pass because runner lacks /dev/fuse and/or mount capability"
-  proof_level=1
-  terminal_classification="STRONG_ENVIRONMENT_BLOCKED"
-elif [[ "$apt_status" != "0" ]]; then
-  classification="setup_defect"
-  classification_detail="filesystem prerequisite installation failed and strict failure was not otherwise classified"
-  proof_level=1
-  terminal_classification="CI_REVIEWABLE_PENDING_GHA_RUN"
+combined_env=target/ci-proof/combined.env
+classification_env=target/ci-proof/classification.env
+: > "$combined_env"
+[ -f target/ci-proof/env.sh ] && cat target/ci-proof/env.sh >> "$combined_env"
+if [ -f target/ci-proof/results.env ]; then
+  sed '/^[^=]*_command=/d' target/ci-proof/results.env >> "$combined_env"
 fi
+# shellcheck disable=SC1090
+set -a
+source "$combined_env" || true
+set +a
 
-if [[ "${FAIL_ON_ENVIRONMENT_LIMIT:-false}" == "true" && "$classification" == "environment_unsupported" ]]; then
-  final_status=2
-elif [[ "$classification" == "implementation_failure" || "$classification" == "setup_defect" ]]; then
-  final_status=1
-else
-  final_status=0
-fi
-
-workflow_run_url=""
-if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
-  workflow_run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-fi
-
-export runner_os runner_arch runner_name image_label kernel os_release id sudo_available dev_fuse_exists dev_fuse_rw overlay_listed mount_path findmnt_path fuse3_installed fuse_overlayfs_installed classification classification_detail terminal_classification allow_skip_used strict_proof_obtained workflow_run_url
-export apt_status overlay_mount_probe_status strict_rofs_status strict_overlay_status strict_combined_status strict_runtime_status proof_level
 python3 - <<'PY'
-import json, os
+import json, os, re, shlex
 from pathlib import Path
+
+def getenv(name, default=""):
+    return os.environ.get(name, default)
 
 def as_int(name, default=999):
     try:
@@ -93,110 +29,261 @@ def as_int(name, default=999):
     except ValueError:
         return default
 
-def log_text(name):
-    path = Path("target/ci-logs") / f"{name}.log"
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return ""
+def as_bool(name):
+    return str(os.environ.get(name, "")).lower() == "true"
+
+def status(name):
+    return as_int(f"{name}_status")
 
 def attempted(name):
-    return as_int(f"{name}_status") != 999
+    return status(name) != 999
 
-def skipped(name):
-    # Workspace-wide strict commands can contain unrelated gated-test messages
-    # (for example xattr or runtime tests outside the current proof level). A
-    # strict proof command is counted as skipped only when allow-skip was
-    # explicitly enabled, which CI treats as invalid proof.
-    _ = name
-    return os.environ.get("allow_skip_used") == "true"
+def skipped(_name):
+    return as_bool("allow_skip_used")
 
 def passed(name):
-    return attempted(name) and as_int(f"{name}_status") == 0 and not skipped(name)
+    return attempted(name) and status(name) == 0 and not skipped(name)
 
-strict_names = ["strict_rofs", "strict_overlay", "strict_combined", "strict_runtime"]
-failing_tests = [
-    name for name in strict_names
-    if attempted(name) and as_int(f"{name}_status") != 0
-]
+def any_pass(*names):
+    return any(passed(name) for name in names)
+
+def any_attempt(*names):
+    return any(attempted(name) for name in names)
+
+def log_text():
+    chunks = []
+    for path in Path("target/ci-logs").glob("*.log"):
+        chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+text = log_text()
+allow_skip_used = as_bool("allow_skip_used")
+strict_rofs_passed = any_pass("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs")
+strict_overlay_passed = any_pass("strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay")
+strict_combined_passed = any_pass("strict_combined_nonsudo", "strict_combined_sudo", "strict_combined")
+strict_runtime_passed = any_pass("strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime")
+strict_rofs_attempted = any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs")
+strict_overlay_attempted = any_attempt("strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay")
+strict_combined_attempted = any_attempt("strict_combined_nonsudo", "strict_combined_sudo", "strict_combined")
+strict_runtime_attempted = any_attempt("strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime")
+
+privileged_route_attempted = any_attempt(
+    "strict_rofs_sudo", "strict_overlay_sudo", "strict_combined_sudo", "strict_runtime_sudo"
+)
+helper_or_priv_probe_attempted = any(
+    as_int(name) != 999 for name in [
+        "overlay_sudo_mount_status",
+        "fuse_overlayfs_rootless_status",
+        "fuse_overlayfs_sudo_status",
+        "kage_rofs_non_sudo_mount_status",
+        "kage_rofs_sudo_mount_status",
+    ]
+)
+
+failing_tests = []
+for name in [
+    "strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs",
+    "strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay",
+    "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined",
+    "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime",
+]:
+    if attempted(name) and status(name) != 0:
+        failing_tests.append(name)
+
 environment_blockers = []
-if os.environ.get("dev_fuse_exists") == "false":
+if getenv("dev_fuse_exists") == "false":
     environment_blockers.append("missing /dev/fuse")
-if os.environ.get("dev_fuse_rw") == "false":
+if getenv("dev_fuse_rw") == "false":
     environment_blockers.append("/dev/fuse is not readable/writable")
-if os.environ.get("overlay_listed") == "false":
+if getenv("overlay_listed") == "false":
     environment_blockers.append("overlay is not listed in /proc/filesystems")
-if as_int("overlay_mount_probe_status") not in (0, 999):
-    environment_blockers.append(f"overlay mount probe exited {as_int('overlay_mount_probe_status')}")
+for field, label in [
+    ("overlay_non_sudo_mount_status", "non-sudo overlay mount"),
+    ("overlay_sudo_mount_status", "sudo overlay mount"),
+    ("fuse_overlayfs_rootless_status", "rootless fuse-overlayfs"),
+    ("fuse_overlayfs_sudo_status", "sudo fuse-overlayfs"),
+]:
+    value = as_int(field)
+    if value not in (0, 999):
+        environment_blockers.append(f"{label} exited {value}")
+if getenv("dev_fuse_exists") == "true" and getenv("sudo_available") == "true" and not privileged_route_attempted:
+    environment_blockers.append("strict privileged/helper mount route not yet exercised")
+if getenv("fuse_overlayfs_available") == "true" and as_int("fuse_overlayfs_rootless_status") == 999 and as_int("fuse_overlayfs_sudo_status") == 999:
+    environment_blockers.append("fuse-overlayfs helper route not yet exercised")
 
-summary = {
-  "runner": {
-    "os": os.environ.get("runner_os", ""),
-    "arch": os.environ.get("runner_arch", ""),
-    "name": os.environ.get("runner_name", ""),
-    "image_label": os.environ.get("image_label", ""),
-  },
-  "kernel": os.environ.get("kernel", ""),
-  "os_release": os.environ.get("os_release", ""),
-  "id": os.environ.get("id", ""),
-  "sudo_available": os.environ.get("sudo_available", "unknown"),
-  "dev_fuse_exists": os.environ.get("dev_fuse_exists", "unknown"),
-  "dev_fuse_readable_writable": os.environ.get("dev_fuse_rw", "unknown"),
-  "overlay_listed": os.environ.get("overlay_listed", "unknown"),
-  "mount_path": os.environ.get("mount_path", ""),
-  "findmnt_path": os.environ.get("findmnt_path", ""),
-  "fuse3_installed": os.environ.get("fuse3_installed", "unknown"),
-  "fuse_overlayfs_installed": os.environ.get("fuse_overlayfs_installed", "unknown"),
-  "apt_status": as_int("apt_status"),
-  "overlay_mount_probe_status": as_int("overlay_mount_probe_status"),
-  "strict_results": {
-    "rofs": as_int("strict_rofs_status"),
-    "overlay": as_int("strict_overlay_status"),
-    "combined": as_int("strict_combined_status"),
-    "runtime": as_int("strict_runtime_status"),
-  },
-  "proof_level_reached": as_int("proof_level", 1),
-  "terminal_classification": os.environ.get("terminal_classification", "IMPLEMENTATION_BUG_WITH_REPRO"),
-  "allow_skip_used": os.environ.get("allow_skip_used") == "true",
-  "strict_proof_obtained": os.environ.get("strict_proof_obtained") == "true",
-  "strict_rofs_attempted": attempted("strict_rofs"),
-  "strict_rofs_passed": passed("strict_rofs"),
-  "strict_rofs_skipped": skipped("strict_rofs"),
-  "strict_overlay_attempted": attempted("strict_overlay"),
-  "strict_overlay_passed": passed("strict_overlay"),
-  "strict_overlay_skipped": skipped("strict_overlay"),
-  "strict_combined_attempted": attempted("strict_combined"),
-  "strict_combined_passed": passed("strict_combined"),
-  "strict_combined_skipped": skipped("strict_combined"),
-  "strict_runtime_attempted": attempted("strict_runtime"),
-  "strict_runtime_passed": passed("strict_runtime"),
-  "strict_runtime_skipped": skipped("strict_runtime"),
-  "environment_blockers": environment_blockers,
-  "failing_tests": failing_tests,
-  "artifact_paths": [
+permission_re = re.compile(r"Operation not permitted|permission denied|must be superuser|CAP_SYS_ADMIN|mount failed", re.I)
+setup_re = re.compile(r"sudo: .*cargo: command not found|No such file or directory.*cargo|rustup: command not found", re.I)
+
+classification = "implementation_failure"
+classification_detail = "strict tests failed for an unclassified reason"
+terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+proof_level = 1
+strict_proof_obtained = False
+
+if allow_skip_used:
+    classification_detail = "allow-skip variable was set in a strict proof job"
+elif strict_runtime_passed:
+    classification = "proof_passed"
+    classification_detail = "Level 4 runtime smoke passed without allow-skip"
+    terminal_classification = "LEVEL4_RUNTIME_PROVEN"
+    proof_level = 4
+    strict_proof_obtained = True
+elif strict_combined_passed or (strict_rofs_passed and strict_overlay_passed):
+    classification = "proof_passed"
+    classification_detail = "Level 3 rofs/overlay substrate passed without full runtime smoke"
+    terminal_classification = "LEVEL3_OVERLAY_AND_LOWER_PROVEN_BUT_RUNTIME_NOT_PROVEN"
+    proof_level = 3
+    strict_proof_obtained = True
+elif strict_rofs_passed:
+    classification = "proof_passed"
+    classification_detail = "Level 2 rofs FUSE mount passed; overlay/runtime did not"
+    terminal_classification = "LEVEL2_ROFS_PROVEN_BUT_OVERLAY_OR_RUNTIME_NOT_PROVEN"
+    proof_level = 2
+    strict_proof_obtained = True
+elif getenv("dev_fuse_exists") == "true" and getenv("sudo_available") == "true" and not privileged_route_attempted:
+    classification = "environment_unsupported"
+    classification_detail = "Level 1 only; /dev/fuse and sudo are present but strict privileged/helper routes were not attempted"
+    terminal_classification = "LEVEL1_MOUNT_FREE_ONLY_PROVEN"
+elif not any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs", "strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay", "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined", "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime") and as_int("apt_status") == 999:
+    classification = "not_run"
+    classification_detail = "proof summary generated without probe or strict-result inputs"
+    terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
+elif setup_re.search(text):
+    classification = "setup_defect"
+    classification_detail = "sudo strict route could not run cargo/toolchain; CI harness needs setup fixes"
+    terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
+elif permission_re.search(text) and (privileged_route_attempted or helper_or_priv_probe_attempted):
+    classification = "environment_unsupported"
+    classification_detail = "strict filesystem proof failed after non-sudo and privileged/helper routes were attempted"
+    terminal_classification = "STRONG_ENVIRONMENT_BLOCKED"
+elif as_int("apt_status") != 0 and not permission_re.search(text):
+    classification = "setup_defect"
+    classification_detail = "filesystem prerequisite installation failed and strict failure was not otherwise classified"
+    terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
+
+workflow_run_url = ""
+if getenv("GITHUB_SERVER_URL") and getenv("GITHUB_REPOSITORY") and getenv("GITHUB_RUN_ID"):
+    workflow_run_url = f"{getenv('GITHUB_SERVER_URL')}/{getenv('GITHUB_REPOSITORY')}/actions/runs/{getenv('GITHUB_RUN_ID')}"
+
+artifact_paths = [
     "target/ci-proof/summary.json",
     "target/ci-proof/summary.md",
     "target/ci-logs/fs-probe.log",
-    "target/ci-logs/strict_rofs.log",
-    "target/ci-logs/strict_overlay.log",
-    "target/ci-logs/strict_combined.log",
-    "target/ci-logs/strict_runtime.log",
-  ],
-  "workflow_run_url": os.environ.get("workflow_run_url", ""),
-  "classification": os.environ.get("classification", "implementation_failure"),
-  "classification_detail": os.environ.get("classification_detail", ""),
+    "target/ci-logs/strict_rofs_nonsudo.log",
+    "target/ci-logs/strict_rofs_sudo.log",
+    "target/ci-logs/strict_overlay_nonsudo.log",
+    "target/ci-logs/strict_overlay_sudo.log",
+    "target/ci-logs/strict_combined_nonsudo.log",
+    "target/ci-logs/strict_combined_sudo.log",
+    "target/ci-logs/strict_runtime_nonsudo.log",
+    "target/ci-logs/strict_runtime_sudo.log",
+]
+summary = {
+    "runner": {
+        "os": getenv("runner_os"),
+        "arch": getenv("runner_arch"),
+        "name": getenv("runner_name"),
+        "image_label": getenv("image_label"),
+    },
+    "kernel": getenv("kernel"),
+    "os_release": getenv("os_release"),
+    "id": getenv("id"),
+    "sudo_available": getenv("sudo_available", "unknown"),
+    "sudo_n_status": as_int("sudo_n_status"),
+    "sudo_id": getenv("sudo_id"),
+    "dev_fuse_exists": getenv("dev_fuse_exists", "unknown"),
+    "dev_fuse_readable_writable": getenv("dev_fuse_rw", "unknown"),
+    "overlay_listed": getenv("overlay_listed", "unknown"),
+    "mount_path": getenv("mount_path"),
+    "findmnt_path": getenv("findmnt_path"),
+    "fusermount3_available": getenv("fusermount3_available", "unknown"),
+    "fusermount3_path": getenv("fusermount3_path"),
+    "fusermount3_setuid_or_usable": getenv("fusermount3_setuid_or_usable", "unknown"),
+    "fuse_overlayfs_available": getenv("fuse_overlayfs_available", "unknown"),
+    "fuse_overlayfs_path": getenv("fuse_overlayfs_path"),
+    "fuse3_installed": getenv("fuse3_installed", "unknown"),
+    "fuse_overlayfs_installed": getenv("fuse_overlayfs_installed", "unknown"),
+    "fuse_conf_present": getenv("fuse_conf_present", "unknown"),
+    "fuse_conf_user_allow_other": getenv("fuse_conf_user_allow_other", "unknown"),
+    "runner_has_cap_sys_admin": getenv("runner_has_cap_sys_admin", "unknown"),
+    "sudo_has_cap_sys_admin": getenv("sudo_has_cap_sys_admin", "unknown"),
+    "apt_status": as_int("apt_status"),
+    "overlay_mount_probe_status": as_int("overlay_mount_probe_status"),
+    "overlay_non_sudo_mount_status": as_int("overlay_non_sudo_mount_status"),
+    "overlay_sudo_mount_status": as_int("overlay_sudo_mount_status"),
+    "fuse_overlayfs_rootless_status": as_int("fuse_overlayfs_rootless_status"),
+    "fuse_overlayfs_sudo_status": as_int("fuse_overlayfs_sudo_status"),
+    "kage_rofs_non_sudo_mount_status": as_int("kage_rofs_non_sudo_mount_status"),
+    "kage_rofs_sudo_mount_status": as_int("kage_rofs_sudo_mount_status"),
+    "strict_results": {
+        "rofs": as_int("strict_rofs_status"),
+        "overlay": as_int("strict_overlay_status"),
+        "combined": as_int("strict_combined_status"),
+        "runtime": as_int("strict_runtime_status"),
+    },
+    "proof_level_reached": proof_level,
+    "terminal_classification": terminal_classification,
+    "allow_skip_used": allow_skip_used,
+    "strict_proof_obtained": strict_proof_obtained,
+    "strict_rofs_attempted": strict_rofs_attempted,
+    "strict_rofs_passed": strict_rofs_passed,
+    "strict_rofs_skipped": skipped("strict_rofs"),
+    "strict_rofs_nonsudo_attempted": attempted("strict_rofs_nonsudo"),
+    "strict_rofs_nonsudo_passed": passed("strict_rofs_nonsudo"),
+    "strict_rofs_sudo_attempted": attempted("strict_rofs_sudo"),
+    "strict_rofs_sudo_passed": passed("strict_rofs_sudo"),
+    "strict_overlay_attempted": strict_overlay_attempted,
+    "strict_overlay_passed": strict_overlay_passed,
+    "strict_overlay_skipped": skipped("strict_overlay"),
+    "strict_overlay_nonsudo_attempted": attempted("strict_overlay_nonsudo"),
+    "strict_overlay_nonsudo_passed": passed("strict_overlay_nonsudo"),
+    "strict_overlay_sudo_attempted": attempted("strict_overlay_sudo"),
+    "strict_overlay_sudo_passed": passed("strict_overlay_sudo"),
+    "strict_combined_attempted": strict_combined_attempted,
+    "strict_combined_passed": strict_combined_passed,
+    "strict_combined_skipped": skipped("strict_combined"),
+    "strict_combined_nonsudo_attempted": attempted("strict_combined_nonsudo"),
+    "strict_combined_nonsudo_passed": passed("strict_combined_nonsudo"),
+    "strict_combined_sudo_attempted": attempted("strict_combined_sudo"),
+    "strict_combined_sudo_passed": passed("strict_combined_sudo"),
+    "strict_runtime_attempted": strict_runtime_attempted,
+    "strict_runtime_passed": strict_runtime_passed,
+    "strict_runtime_skipped": skipped("strict_runtime"),
+    "strict_runtime_nonsudo_attempted": attempted("strict_runtime_nonsudo"),
+    "strict_runtime_nonsudo_passed": passed("strict_runtime_nonsudo"),
+    "strict_runtime_sudo_attempted": attempted("strict_runtime_sudo"),
+    "strict_runtime_sudo_passed": passed("strict_runtime_sudo"),
+    "environment_blockers": environment_blockers,
+    "failing_tests": failing_tests,
+    "artifact_paths": artifact_paths,
+    "workflow_run_url": workflow_run_url,
+    "classification": classification,
+    "classification_detail": classification_detail,
 }
-with open("target/ci-proof/summary.json", "w", encoding="utf-8") as f:
-    json.dump(summary, f, indent=2, ensure_ascii=False)
+Path("target/ci-proof/summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+Path("target/ci-proof/classification.env").write_text(
+    "\n".join([
+        f"classification={shlex.quote(classification)}",
+        f"classification_detail={shlex.quote(classification_detail)}",
+        f"terminal_classification={shlex.quote(terminal_classification)}",
+        f"proof_level={proof_level}",
+        f"strict_proof_obtained={'true' if strict_proof_obtained else 'false'}",
+        f"final_status={'2' if os.environ.get('FAIL_ON_ENVIRONMENT_LIMIT') == 'true' and classification == 'environment_unsupported' else '1' if classification in ('implementation_failure', 'setup_defect') else '0'}",
+    ]) + "\n",
+    encoding="utf-8",
+)
 PY
+# shellcheck disable=SC1091
+source "$classification_env"
+
 cat > "$summary_md" <<MD
 # kage CI filesystem proof summary
 
-**Classification:** ${classification}  
+**Classification:** ${classification}
 **Terminal classification:** ${terminal_classification}
-**Detail:** ${classification_detail}  
-**Proof level reached:** Level ${proof_level}  
-**Allow-skip used:** ${allow_skip_used}  
+**Detail:** ${classification_detail}
+**Proof level reached:** Level ${proof_level}
+**Allow-skip used:** ${allow_skip_used:-false}
 **Strict proof obtained:** ${strict_proof_obtained}
 
 | Probe | Result |
@@ -205,23 +292,35 @@ cat > "$summary_md" <<MD
 | Kernel | ${kernel:-unknown} |
 | /dev/fuse exists | ${dev_fuse_exists:-unknown} |
 | /dev/fuse read/write | ${dev_fuse_rw:-unknown} |
+| fusermount3 available | ${fusermount3_available:-unknown} |
+| fuse-overlayfs available | ${fuse_overlayfs_available:-unknown} |
+| sudo available | ${sudo_available:-unknown} |
+| runner CAP_SYS_ADMIN | ${runner_has_cap_sys_admin:-unknown} |
+| sudo CAP_SYS_ADMIN | ${sudo_has_cap_sys_admin:-unknown} |
 | overlay in /proc/filesystems | ${overlay_listed:-unknown} |
-| apt status | ${apt_status} |
-| overlay mount probe status | ${overlay_mount_probe_status:-999} |
-| strict rofs status | ${strict_rofs_status} |
-| strict overlay status | ${strict_overlay_status} |
-| strict combined status | ${strict_combined_status} |
-| strict runtime status | ${strict_runtime_status} |
+| apt status | ${apt_status:-999} |
+| overlay non-sudo mount status | ${overlay_non_sudo_mount_status:-999} |
+| overlay sudo mount status | ${overlay_sudo_mount_status:-999} |
+| fuse-overlayfs rootless status | ${fuse_overlayfs_rootless_status:-999} |
+| fuse-overlayfs sudo status | ${fuse_overlayfs_sudo_status:-999} |
+| strict rofs status | ${strict_rofs_status:-999} |
+| strict overlay status | ${strict_overlay_status:-999} |
+| strict combined status | ${strict_combined_status:-999} |
+| strict runtime status | ${strict_runtime_status:-999} |
 
 Artifacts to inspect:
 
-- \`target/ci-proof/summary.json\`
-- \`target/ci-proof/summary.md\`
-- \`target/ci-logs/fs-probe.log\`
-- \`target/ci-logs/strict_rofs.log\`
-- \`target/ci-logs/strict_overlay.log\`
-- \`target/ci-logs/strict_combined.log\`
-- \`target/ci-logs/strict_runtime.log\`
+- target/ci-proof/summary.json
+- target/ci-proof/summary.md
+- target/ci-logs/fs-probe.log
+- target/ci-logs/strict_rofs_nonsudo.log
+- target/ci-logs/strict_rofs_sudo.log
+- target/ci-logs/strict_overlay_nonsudo.log
+- target/ci-logs/strict_overlay_sudo.log
+- target/ci-logs/strict_combined_nonsudo.log
+- target/ci-logs/strict_combined_sudo.log
+- target/ci-logs/strict_runtime_nonsudo.log
+- target/ci-logs/strict_runtime_sudo.log
 MD
 
 cat "$summary_md"

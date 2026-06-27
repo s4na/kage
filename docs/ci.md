@@ -24,12 +24,16 @@ The filesystem probe uploads `kage-ci-proof-fs-capability-probe` containing:
 - `target/ci-proof/summary.json`
 - `target/ci-proof/summary.md`
 - `target/ci-logs/fs-probe.log`
-- `target/ci-logs/strict_rofs.log`
-- `target/ci-logs/strict_overlay.log`
-- `target/ci-logs/strict_combined.log`
-- `target/ci-logs/strict_runtime.log`
+- `target/ci-logs/strict_rofs_nonsudo.log`
+- `target/ci-logs/strict_rofs_sudo.log`
+- `target/ci-logs/strict_overlay_nonsudo.log`
+- `target/ci-logs/strict_overlay_sudo.log`
+- `target/ci-logs/strict_combined_nonsudo.log`
+- `target/ci-logs/strict_combined_sudo.log`
+- `target/ci-logs/strict_runtime_nonsudo.log`
+- `target/ci-logs/strict_runtime_sudo.log`
 
-`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, overlay availability, strict command exit codes, proof level reached, terminal classification, allow-skip status, attempted/passed/skipped booleans for every strict proof command, environment blockers, failing tests, artifact paths, and the workflow run URL when GitHub exposes it.
+`summary.json` is machine-readable and contains runner metadata, `/dev/fuse` state, `fusermount3` and `fuse-overlayfs` availability, sudo availability and capability hints, non-sudo and sudo overlay probes, rootless and sudo `fuse-overlayfs` probes, strict command exit codes, proof level reached, terminal classification, allow-skip status, attempted/passed/skipped booleans for every strict proof command including non-sudo/sudo routes, environment blockers, failing tests, artifact paths, and the workflow run URL when GitHub exposes it.
 
 ## Interpreting outcomes
 
@@ -37,7 +41,7 @@ The filesystem probe uploads `kage-ci-proof-fs-capability-probe` containing:
 - **Level 2 passed, Level 3 failed:** rofs FUSE mount works; overlayfs mount is blocked or broken.
 - **Level 3 passed, Level 2 failed:** overlayfs mount works; rofs FUSE mount is blocked or broken.
 - **Level 4 passed:** GitHub-hosted runner proved rofs + overlay + commit-back runtime smoke without allow-skip.
-- **environment_unsupported:** runner lacks `/dev/fuse`, mount capability, or overlay permission. CI is green only because the limitation was classified.
+- **environment_unsupported:** runner lacks `/dev/fuse`, mount capability, overlay permission, or helper/sudo routes after those routes were actually attempted. A non-sudo mount failure alone is not enough for `STRONG_ENVIRONMENT_BLOCKED`.
 - **setup_defect:** dependency installation or setup failed in a way that prevented classification.
 - **implementation_failure:** capabilities appeared available or failure was ambiguous; Codex should inspect and fix code/tests/CI.
 
@@ -69,3 +73,7 @@ find gha-artifacts -maxdepth 4 -type f | sort
 ```
 
 Paste back the workflow run URL plus `target/ci-proof/summary.json`, `target/ci-proof/summary.md`, `target/ci-logs/fs-probe.log`, and any failing strict logs from the downloaded `kage-ci-proof-fs-capability-probe` artifact.
+
+## Classification note from run 28281744534
+
+A prior GitHub Actions artifact from `https://github.com/s4na/kage/actions/runs/28281744534` reported Level 1 and `STRONG_ENVIRONMENT_BLOCKED` even though `/dev/fuse`, passwordless `sudo`, `fuse3`, and `fuse-overlayfs` were available. That classification was too strong because the harness had not yet tried sudo/helper routes. New summaries should classify that shape as `LEVEL1_MOUNT_FREE_ONLY_PROVEN` unless the privileged/helper matrix has actually been exercised and failed for environment reasons.
