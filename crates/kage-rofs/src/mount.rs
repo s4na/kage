@@ -24,7 +24,7 @@ pub enum RofsBackend {
 impl RofsBackend {
     pub fn selected() -> Result<Self> {
         match std::env::var("KAGE_ROFS_BACKEND").ok().as_deref() {
-            None | Some("") => Ok(Self::Fuser),
+            None | Some("") => Ok(Self::Handwritten),
             Some("fuser") => Ok(Self::Fuser),
             Some("handwritten") => Ok(Self::Handwritten),
             Some(other) => Err(format!(

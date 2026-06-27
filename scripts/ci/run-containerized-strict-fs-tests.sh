@@ -122,10 +122,10 @@ tar -C /src --exclude=target -cf - . | tar -C /work/kage -xf -
 cd /work/kage
 cargo --version | tee -a /out/logs/container_probe.log
 rustc --version | tee -a /out/logs/container_probe.log
-run_strict rofs env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
+run_strict rofs env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
 run_strict overlay env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict combined env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_strict runtime env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_strict combined env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_strict runtime env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
 cat /out/proof/container.env
 '
 
