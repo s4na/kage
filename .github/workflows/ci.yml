@@ -4,19 +4,38 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_strict_fs:
+        description: Run strict filesystem capability probe
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      fail_on_environment_limit:
+        description: Fail if GitHub-hosted runner cannot prove Level 4
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      runner_label:
+        description: Runner label to use for Linux jobs
+        required: false
+        default: ubuntu-24.04
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Needed so the pinned checkout action can read repository contents.
+# Needed so pinned actions can read repository contents.
 permissions:
   contents: read
 
 jobs:
-  rust:
-    name: rust
-    runs-on: ubuntu-latest
+  rust-default:
+    name: Level 0 rust default
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -26,16 +45,62 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: scripts/ci-test-summary.sh
+      - name: Run default checks
+        run: scripts/ci/run-default-checks.sh
+
+  rofs-mount-free:
+    name: Level 1 rofs mount-free
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Run focused mount-free tests
+        run: |
+          cargo test -p kage-rofs --all-features -- --nocapture
+          cargo test -p kage-cli --all-features -- --nocapture
+          cargo test -p kage-core --all-features -- --nocapture
+
+  fs-capability-probe:
+    name: Level 2-4 fs capability probe
+    needs: [rust-default, rofs-mount-free]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_strict_fs == 'true' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || 'ubuntu-24.04' }}
+    env:
+      FAIL_ON_ENVIRONMENT_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_environment_limit || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Probe GitHub-hosted filesystem capabilities
+        run: scripts/ci/probe-github-hosted-fs.sh
+      - name: Run strict filesystem tests without allow-skip
+        run: scripts/ci/run-strict-fs-tests.sh
+      - name: Classify strict filesystem proof
+        run: scripts/ci/write-proof-summary.sh
+      - name: Upload CI proof artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kage-ci-proof-${{ github.job }}
+          path: |
+            target/ci-proof/**
+            target/ci-logs/**
+          if-no-files-found: error
 
   gha-lint:
     name: gha lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -46,7 +111,7 @@ jobs:
 
   zizmor:
     name: gha zizmor
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

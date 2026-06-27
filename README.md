@@ -299,6 +299,8 @@ scripts/run-privileged-linux-tests.sh
 
 This script installs/checks Linux test prerequisites where possible, then runs default checks plus strict rofs, overlayfs, combined rofs+overlay, and runtime smoke tests inside a privileged Linux container with `/dev/fuse` passed through. Hosted CI runners may not provide the required kernel capabilities; use a capable local Linux host, VM, or self-hosted runner.
 
+GitHub Actions proof classification is documented in `docs/ci.md`. After a run, download the `kage-ci-proof-fs-capability-probe` artifact and use `docs/ci-result-triage.md` or `docs/prompts/triage-gha-result.md` to paste the result back for review.
+
 ## Development notes
 
 - Do not use `git checkout` or `git worktree` as the primary workspace mechanism.
