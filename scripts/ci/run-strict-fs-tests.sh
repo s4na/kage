@@ -4,6 +4,7 @@ set -euo pipefail
 mkdir -p target/ci-proof target/ci-logs
 results=target/ci-proof/results.env
 : > "$results"
+STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-240}"
 
 if [[ -n "${KAGE_TEST_ROFS_ALLOW_SKIP:-}" || -n "${KAGE_TEST_OVERLAY_ALLOW_SKIP:-}" ]]; then
   echo "allow_skip_used=true" >> "$results"
@@ -18,9 +19,9 @@ run_case() {
   local name="$1"
   shift
   local log="target/ci-logs/${name}.log"
-  echo "== $name: $* ==" | tee "$log"
+  echo "== $name: timeout ${STRICT_TEST_TIMEOUT_SECONDS}s $* ==" | tee "$log"
   set +e
-  "$@" >> "$log" 2>&1
+  timeout --preserve-status "${STRICT_TEST_TIMEOUT_SECONDS}s" "$@" >> "$log" 2>&1
   local status=$?
   set -e
   record_status "$name" "$status"
@@ -66,6 +67,8 @@ error_kind_from_log() {
   local log="$1"
   if grep -Eqi 'Invalid argument|os error 22|EINVAL' "$log"; then
     printf '%s' direct_mount_einval
+  elif grep -Eqi 'timed out|timeout|Command exited with non-zero status 124' "$log"; then
+    printf '%s' timeout
   elif grep -Eqi 'Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN' "$log"; then
     printf '%s' permission_denied
   elif grep -Eqi '/dev/fuse is unavailable|No such file or directory.*/dev/fuse' "$log"; then

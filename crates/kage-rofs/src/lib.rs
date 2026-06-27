@@ -6,7 +6,7 @@ use std::{
     os::fd::RawFd,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
 };
@@ -815,18 +815,20 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
         let _ = c_fcntl(fds[1], F_SETFD, FD_CLOEXEC);
     }
     let commfd = fds[0].to_string();
-    let output = Command::new("fusermount3")
+    let child = Command::new("fusermount3")
         .env("_FUSE_COMMFD", &commfd)
         .arg("-o")
         .arg(fusermount3_options())
         .arg("--")
         .arg(mountpoint)
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
     unsafe {
         close_fd(fds[0]);
     }
-    let output = match output {
-        Ok(output) => output,
+    let child = match child {
+        Ok(child) => child,
         Err(err) => {
             unsafe {
                 close_fd(fds[1]);
@@ -834,10 +836,11 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
             return Err(format!("failed to spawn fusermount3 helper: {err}").into());
         }
     };
-    let fd = unsafe { receive_fd(fds[1]) };
+    let fd = unsafe { receive_fd_with_timeout(fds[1], 15_000) };
     unsafe {
         close_fd(fds[1]);
     }
+    let output = child.wait_with_output()?;
     if output.status.success() && fd >= 0 {
         unsafe {
             let _ = c_fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -858,7 +861,15 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
     }
 }
 
-unsafe fn receive_fd(socket: RawFd) -> RawFd {
+unsafe fn receive_fd_with_timeout(socket: RawFd, timeout_ms: i32) -> RawFd {
+    let mut pfd = PollFd {
+        fd: socket,
+        events: POLLIN,
+        revents: 0,
+    };
+    if poll(&mut pfd, 1, timeout_ms) <= 0 || (pfd.revents & POLLIN) == 0 {
+        return -1;
+    }
     let mut byte = [0_u8; 1];
     let mut iov = Iovec {
         iov_base: byte.as_mut_ptr().cast(),
@@ -951,6 +962,7 @@ const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const F_SETFD: i32 = 2;
 const FD_CLOEXEC: i32 = 1;
+const POLLIN: i16 = 0x0001;
 const ENOENT: i32 = 2;
 const ENOSYS: i32 = 38;
 const ENOTDIR: i32 = 20;
@@ -1011,6 +1023,13 @@ struct Cmsghdr {
     cmsg_type: i32,
 }
 
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 unsafe extern "C" {
     fn open(path: *const i8, flags: i32, mode: u32) -> i32;
     fn close(fd: i32) -> i32;
@@ -1026,6 +1045,7 @@ unsafe extern "C" {
     fn umount2(target: *const i8, flags: i32) -> i32;
     fn socketpair(domain: i32, kind: i32, protocol: i32, sv: *mut i32) -> i32;
     fn recvmsg(sockfd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn getuid() -> u32;
     fn getgid() -> u32;
