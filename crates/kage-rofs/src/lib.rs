@@ -1,3 +1,5 @@
+mod fuser_backend;
+
 use kage_core::validate_relative_path;
 use std::{
     collections::HashMap,
@@ -250,6 +252,33 @@ pub fn rofs_mount_available() -> bool {
     Path::new("/dev/fuse").exists()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RofsBackend {
+    Fuser,
+    Handwritten,
+}
+
+impl RofsBackend {
+    pub fn selected() -> Result<Self> {
+        match std::env::var("KAGE_ROFS_BACKEND").ok().as_deref() {
+            None | Some("") => Ok(Self::Fuser),
+            Some("fuser") => Ok(Self::Fuser),
+            Some("handwritten") => Ok(Self::Handwritten),
+            Some(other) => Err(format!(
+                "unsupported KAGE_ROFS_BACKEND={other}; expected fuser or handwritten"
+            )
+            .into()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fuser => "fuser",
+            Self::Handwritten => "handwritten",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RofsMount {
     mountpoint: PathBuf,
@@ -288,6 +317,11 @@ impl Drop for RofsMount {
 }
 
 pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMount> {
+    let backend = RofsBackend::selected()?;
+    eprintln!("kage-rofs strict mount backend={}", backend.name());
+    if backend == RofsBackend::Fuser {
+        return fuser_backend::mount_rofs_fuser(view, mountpoint);
+    }
     if !rofs_mount_available() {
         return Err("/dev/fuse is unavailable; cannot mount kage-rofs".into());
     }
@@ -1464,6 +1498,7 @@ mod tests {
         let view = GitTreeView::open(&repo, "main").map_err(|err| err.to_string())?;
         let mount = temp("mount");
         fs::create_dir_all(&mount).map_err(|err| err.to_string())?;
+        let backend = RofsBackend::selected().map_err(|err| err.to_string())?;
         match mount_rofs_strict(&view, &mount) {
             Ok(handle) => {
                 let findmnt = Command::new("findmnt").arg(&mount).output();
@@ -1488,7 +1523,7 @@ mod tests {
                 eprintln!("kage-rofs strict test: unmounting");
                 handle.unmount().map_err(|err| err.to_string())?;
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(format!("backend={} error_detail={err}", backend.name())),
         }
         fs::remove_dir_all(repo).map_err(|err| err.to_string())?;
         fs::remove_dir_all(mount).map_err(|err| err.to_string())?;
