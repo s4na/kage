@@ -8,6 +8,7 @@ combined_env=target/ci-proof/combined.env
 classification_env=target/ci-proof/classification.env
 : > "$combined_env"
 [ -f target/ci-proof/env.sh ] && cat target/ci-proof/env.sh >> "$combined_env"
+[ -f target/ci-proof/container-host.env ] && cat target/ci-proof/container-host.env >> "$combined_env"
 [ -f target/ci-proof/container.env ] && cat target/ci-proof/container.env >> "$combined_env"
 if [ -f target/ci-proof/results.env ]; then
   sed '/^[^=]*_command=/d' target/ci-proof/results.env >> "$combined_env"
@@ -182,6 +183,10 @@ elif getenv("dev_fuse_exists") == "true" and getenv("sudo_available") == "true" 
     classification = "environment_unsupported"
     classification_detail = "Level 1 only; /dev/fuse and sudo are present but strict privileged/helper routes were not attempted"
     terminal_classification = "LEVEL1_MOUNT_FREE_ONLY_PROVEN"
+elif as_int("containerized_image_build_status") not in (0, 999):
+    classification = "setup_defect"
+    classification_detail = "containerized strict image build failed before strict tests could run"
+    terminal_classification = "CI_REVIEWABLE_PENDING_GHA_RUN"
 elif not any_attempt("strict_rofs_nonsudo", "strict_rofs_sudo", "strict_rofs", "strict_overlay_nonsudo", "strict_overlay_sudo", "strict_overlay", "strict_combined_nonsudo", "strict_combined_sudo", "strict_combined", "strict_runtime_nonsudo", "strict_runtime_sudo", "strict_runtime") and as_int("apt_status") == 999:
     classification = "not_run"
     classification_detail = "proof summary generated without probe or strict-result inputs"
@@ -327,6 +332,10 @@ summary = {
     "containerized_strict_attempted": containerized_strict_attempted,
     "containerized_strict_image": getenv("containerized_strict_image"),
     "containerized_privileged_attempted": as_bool("containerized_privileged_attempted"),
+    "containerized_docker_available": getenv("containerized_docker_available", "unknown"),
+    "containerized_image_build_status": as_int("containerized_image_build_status"),
+    "containerized_apparmor_unconfined_status": as_int("containerized_apparmor_unconfined_status"),
+    "containerized_docker_run_status": as_int("containerized_docker_run_status"),
     "containerized_dev_fuse_exists": getenv("containerized_dev_fuse_exists", "unknown"),
     "containerized_dev_fuse_readable_writable": getenv("containerized_dev_fuse_readable_writable", "unknown"),
     "containerized_fusermount3_available": getenv("containerized_fusermount3_available", "unknown"),
@@ -401,6 +410,10 @@ cat > "$summary_md" <<MD
 | strict combined status | ${strict_combined_status:-999} |
 | strict runtime status | ${strict_runtime_status:-999} |
 | containerized strict image | ${containerized_strict_image:-unknown} |
+| containerized docker available | ${containerized_docker_available:-unknown} |
+| containerized image build status | ${containerized_image_build_status:-999} |
+| containerized apparmor=unconfined status | ${containerized_apparmor_unconfined_status:-999} |
+| containerized docker run status | ${containerized_docker_run_status:-999} |
 | containerized /dev/fuse exists | ${containerized_dev_fuse_exists:-unknown} |
 | containerized /dev/fuse read/write | ${containerized_dev_fuse_readable_writable:-unknown} |
 | containerized overlay mount status | ${containerized_overlay_mount_status:-999} |

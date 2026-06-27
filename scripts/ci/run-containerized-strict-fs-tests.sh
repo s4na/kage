@@ -11,27 +11,29 @@ for log in \
   : > "$log"
 done
 container_env=target/ci-proof/container.env
+host_container_env=target/ci-proof/container-host.env
 : > "$container_env"
+: > "$host_container_env"
 STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
 IMAGE="${KAGE_CONTAINER_STRICT_IMAGE:-kage-strict:ci}"
 DOCKERFILE="${KAGE_CONTAINER_STRICT_DOCKERFILE:-.github/docker/kage-strict/Dockerfile}"
 
-echo "containerized_strict_attempted=true" >> "$container_env"
-echo "containerized_strict_image=$IMAGE" >> "$container_env"
-echo "containerized_privileged_attempted=true" >> "$container_env"
+echo "containerized_strict_attempted=true" >> "$host_container_env"
+echo "containerized_strict_image=$IMAGE" >> "$host_container_env"
+echo "containerized_privileged_attempted=true" >> "$host_container_env"
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "containerized_docker_available=false" >> "$container_env"
+  echo "containerized_docker_available=false" >> "$host_container_env"
   echo "docker unavailable; containerized strict proof not attempted" | tee target/ci-logs/container_probe.log
   exit 0
 fi
-echo "containerized_docker_available=true" >> "$container_env"
+echo "containerized_docker_available=true" >> "$host_container_env"
 
 set +e
 docker build -f "$DOCKERFILE" -t "$IMAGE" . 2>&1 | tee target/ci-logs/container_image_build.log
 build_status=${PIPESTATUS[0]}
 set -e
-echo "containerized_image_build_status=$build_status" >> "$container_env"
+echo "containerized_image_build_status=$build_status" >> "$host_container_env"
 if [ "$build_status" -ne 0 ]; then
   echo "container strict image build failed with status $build_status; see target/ci-logs/container_image_build.log" | tee -a target/ci-logs/container_probe.log
   exit 0
@@ -142,13 +144,13 @@ status=$?
 set -e
 if [ "$status" -ne 0 ]; then
   echo "containerized privileged run with apparmor=unconfined exited $status; retrying without apparmor" | tee -a target/ci-logs/container_probe.log
-  echo "containerized_apparmor_unconfined_status=$status" >> "$container_env"
+  echo "containerized_apparmor_unconfined_status=$status" >> "$host_container_env"
   set +e
   run_container
   status=$?
   set -e
 fi
-echo "containerized_docker_run_status=$status" >> "$container_env"
+echo "containerized_docker_run_status=$status" >> "$host_container_env"
 if [ -f target/ci-proof/container.env ]; then
   # Container writes this file via /out/proof; keep it as the canonical container result.
   true
