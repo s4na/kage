@@ -366,18 +366,29 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 
 fn diff_copy(base: &Path, merged: &Path, upper: &Path) -> Result<()> {
     for entry in walk(merged)? {
-        if fs::metadata(&entry)?.is_dir() {
+        let meta = fs::symlink_metadata(&entry)?;
+        if meta.is_dir() {
             continue;
         }
         let rel = entry.strip_prefix(merged)?;
         let base_path = base.join(rel);
-        let changed = !base_path.is_file() || fs::read(&entry)? != fs::read(&base_path)?;
-        if changed {
-            let target = upper.join(rel);
-            if let Some(p) = target.parent() {
-                fs::create_dir_all(p)?;
+        let target = upper.join(rel);
+        if let Some(p) = target.parent() {
+            fs::create_dir_all(p)?;
+        }
+        if meta.file_type().is_symlink() {
+            let link = fs::read_link(&entry)?;
+            let changed = fs::read_link(&base_path).map_or(true, |base_link| base_link != link);
+            if changed {
+                let _ = fs::remove_file(&target);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(link, target)?;
             }
-            fs::copy(&entry, target)?;
+        } else {
+            let changed = !base_path.is_file() || fs::read(&entry)? != fs::read(&base_path)?;
+            if changed {
+                fs::copy(&entry, target)?;
+            }
         }
     }
     Ok(())

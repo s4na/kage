@@ -156,6 +156,18 @@ fn fallback_backend_tree_matches_expected_git_tree() {
             .code()
             != Some(0)
     );
+    assert!(
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["ls-tree", &tree, "link"])
+                .current_dir(&repo_dir)
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .starts_with("120000"),
+        "fallback backend must preserve edited symlinks as Git symlinks"
+    );
     fs::remove_dir_all(repo_dir).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
