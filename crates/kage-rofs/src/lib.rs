@@ -313,13 +313,19 @@ pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMo
 }
 
 fn mount_fuse_direct(mountpoint: &Path) -> Result<RawFd> {
+    eprintln!(
+        "kage-rofs direct mount: attempting mountpoint={}",
+        mountpoint.display()
+    );
     let fd = unsafe { open_fuse()? };
     if let Err(err) = unsafe { mount_fuse(fd, mountpoint) } {
         unsafe {
             close_fd(fd);
         }
+        eprintln!("kage-rofs direct mount: failed: {err}");
         return Err(err);
     }
+    eprintln!("kage-rofs direct mount: succeeded fd={fd}");
     Ok(fd)
 }
 
@@ -803,6 +809,12 @@ fn fusermount3_options() -> String {
 }
 
 fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
+    eprintln!(
+        "kage-rofs fusermount3 helper: attempting mountpoint={} argv=fusermount3 -o {} -- {}",
+        mountpoint.display(),
+        fusermount3_options(),
+        mountpoint.display()
+    );
     let mut fds = [0; 2];
     if unsafe { socketpair(AF_UNIX, SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
         return Err(format!(
@@ -815,6 +827,7 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
         let _ = c_fcntl(fds[1], F_SETFD, FD_CLOEXEC);
     }
     let commfd = fds[0].to_string();
+    eprintln!("kage-rofs fusermount3 helper: _FUSE_COMMFD={commfd}");
     let child = Command::new("fusermount3")
         .env("_FUSE_COMMFD", &commfd)
         .arg("-o")
@@ -828,7 +841,10 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
         close_fd(fds[0]);
     }
     let child = match child {
-        Ok(child) => child,
+        Ok(child) => {
+            eprintln!("kage-rofs fusermount3 helper: spawned pid={}", child.id());
+            child
+        }
         Err(err) => {
             unsafe {
                 close_fd(fds[1]);
@@ -836,7 +852,9 @@ fn mount_fuse_with_fusermount3(mountpoint: &Path) -> Result<RawFd> {
             return Err(format!("failed to spawn fusermount3 helper: {err}").into());
         }
     };
+    eprintln!("kage-rofs fusermount3 helper: waiting for fd");
     let fd = unsafe { receive_fd_with_timeout(fds[1], 15_000) };
+    eprintln!("kage-rofs fusermount3 helper: fd receive result={fd}");
     unsafe {
         close_fd(fds[1]);
     }
@@ -1083,6 +1101,9 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
+        sync::mpsc,
+        thread,
+        time::Duration,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1418,34 +1439,60 @@ mod tests {
             );
             return;
         }
-        let repo = fixture_repo();
-        let view = GitTreeView::open(&repo, "main").unwrap();
-        let mount = temp("mount");
-        fs::create_dir_all(&mount).unwrap();
-        match mount_rofs_strict(&view, &mount) {
-            Ok(handle) => {
-                assert_eq!(
-                    fs::read_to_string(mount.join("README.md")).unwrap(),
-                    "hello world"
-                );
-                assert_eq!(
-                    fs::read(mount.join("binary.bin")).unwrap(),
-                    vec![0, 1, 2, 255]
-                );
-                assert_eq!(
-                    fs::read_link(mount.join("link")).unwrap(),
-                    PathBuf::from("README.md")
-                );
-                assert!(fs::write(mount.join("new.txt"), "nope").is_err());
-                handle.unmount().unwrap();
-            }
-            Err(err) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = rofs_mount_strict_test_body();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
                 eprintln!("WARNING: skipping rofs mount body: {err}");
             }
-            Err(err) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
+            Ok(Err(err)) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "KAGE_TEST_ROFS=1 rofs strict mount body timed out after 20s; inspect helper/direct mount diagnostics"
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("KAGE_TEST_ROFS=1 rofs strict mount body exited without reporting a result")
+            }
         }
-        fs::remove_dir_all(repo).unwrap();
-        fs::remove_dir_all(mount).unwrap();
+    }
+
+    fn rofs_mount_strict_test_body() -> std::result::Result<(), String> {
+        let repo = fixture_repo();
+        let view = GitTreeView::open(&repo, "main").map_err(|err| err.to_string())?;
+        let mount = temp("mount");
+        fs::create_dir_all(&mount).map_err(|err| err.to_string())?;
+        match mount_rofs_strict(&view, &mount) {
+            Ok(handle) => {
+                let findmnt = Command::new("findmnt").arg(&mount).output();
+                eprintln!("kage-rofs strict test findmnt: {findmnt:?}");
+                eprintln!("kage-rofs strict test: reading README.md");
+                assert_eq!(
+                    fs::read_to_string(mount.join("README.md")).map_err(|err| err.to_string())?,
+                    "hello world"
+                );
+                eprintln!("kage-rofs strict test: reading binary.bin");
+                assert_eq!(
+                    fs::read(mount.join("binary.bin")).map_err(|err| err.to_string())?,
+                    vec![0, 1, 2, 255]
+                );
+                eprintln!("kage-rofs strict test: reading symlink");
+                assert_eq!(
+                    fs::read_link(mount.join("link")).map_err(|err| err.to_string())?,
+                    PathBuf::from("README.md")
+                );
+                eprintln!("kage-rofs strict test: verifying read-only write failure");
+                assert!(fs::write(mount.join("new.txt"), "nope").is_err());
+                eprintln!("kage-rofs strict test: unmounting");
+                handle.unmount().map_err(|err| err.to_string())?;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+        fs::remove_dir_all(repo).map_err(|err| err.to_string())?;
+        fs::remove_dir_all(mount).map_err(|err| err.to_string())?;
+        Ok(())
     }
 }
 

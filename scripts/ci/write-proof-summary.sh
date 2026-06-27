@@ -104,8 +104,13 @@ for field, label in [
     ("fuse_overlayfs_sudo_status", "sudo fuse-overlayfs"),
 ]:
     value = as_int(field)
-    if value not in (0, 999):
-        environment_blockers.append(f"{label} exited {value}")
+    if value in (0, 999):
+        continue
+    if field == "overlay_non_sudo_mount_status" and as_int("overlay_sudo_mount_status") == 0:
+        continue
+    if field == "fuse_overlayfs_rootless_status" and as_int("fuse_overlayfs_sudo_status") == 0:
+        continue
+    environment_blockers.append(f"{label} exited {value}")
 if getenv("dev_fuse_exists") == "true" and getenv("sudo_available") == "true" and not privileged_route_attempted:
     environment_blockers.append("strict privileged/helper mount route not yet exercised")
 if getenv("fuse_overlayfs_available") == "true" and as_int("fuse_overlayfs_rootless_status") == 999 and as_int("fuse_overlayfs_sudo_status") == 999:
@@ -114,6 +119,8 @@ if getenv("fuse_overlayfs_available") == "true" and as_int("fuse_overlayfs_rootl
 permission_re = re.compile(r"Operation not permitted|permission denied|must be superuser|CAP_SYS_ADMIN|mount failed", re.I)
 setup_re = re.compile(r"sudo: .*cargo: command not found|No such file or directory.*cargo|rustup: command not found", re.I)
 git_index_conflict_re = re.compile(r"appears as both a file and as a directory|cannot add to the index|git update-index", re.I)
+tree_mismatch_re = re.compile(r"assertion.*left.*right|tree hash mismatch|fallback tree hash|overlay tree hash", re.I | re.S)
+timeout_re = re.compile(r"timed out|timeout|has been running for over 60 seconds|status: 143|Command exited with non-zero status 124", re.I)
 rofs_einval_re = re.compile(r"kage-rofs fuse mount failed:.*Invalid argument|direct FUSE mount returned EINVAL|os error 22", re.I)
 capable_overlay_failed = as_int("overlay_sudo_mount_status") == 0 and attempted("strict_overlay_sudo") and not passed("strict_overlay_sudo")
 capable_rofs_failed = (
@@ -166,11 +173,19 @@ elif capable_overlay_failed and git_index_conflict_re.search(text):
     classification = "implementation_failure"
     classification_detail = "sudo overlay substrate passed, but strict overlay failed with a Git index file/directory conflict"
     terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif capable_overlay_failed and tree_mismatch_re.search(text):
+    classification = "implementation_failure"
+    classification_detail = "sudo overlay substrate passed, but strict overlay tree output did not match fallback tree output"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
+elif capable_rofs_failed and timeout_re.search(text):
+    classification = "implementation_failure"
+    classification_detail = "usable /dev/fuse plus fusermount3/sudo route existed, but strict kage-rofs mount timed out"
+    terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
 elif capable_rofs_failed and rofs_einval_re.search(text):
     classification = "implementation_failure"
-    classification_detail = "sudo/CAP_SYS_ADMIN rofs route was available, but direct kage-rofs FUSE mount returned EINVAL"
+    classification_detail = "sudo/helper rofs route was available, but direct kage-rofs FUSE mount returned EINVAL"
     terminal_classification = "IMPLEMENTATION_BUG_WITH_REPRO"
-elif permission_re.search(text) and (privileged_route_attempted or helper_or_priv_probe_attempted):
+elif permission_re.search(text) and (privileged_route_attempted or helper_or_priv_probe_attempted) and not (capable_rofs_failed or capable_overlay_failed):
     classification = "environment_unsupported"
     classification_detail = "strict filesystem proof failed after non-sudo and privileged/helper routes were attempted"
     terminal_classification = "STRONG_ENVIRONMENT_BLOCKED"

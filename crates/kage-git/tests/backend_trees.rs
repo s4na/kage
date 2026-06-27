@@ -83,6 +83,37 @@ fn fallback_tree(repo: &GitRepo, parent: &str, root: &Path) -> String {
     repo.tree_from_layer(parent, &paths.upper).unwrap()
 }
 
+fn git_text(repo_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .unwrap();
+    format!(
+        "status={}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn tree_dump(repo_dir: &Path, tree: &str) -> String {
+    git_text(repo_dir, &["ls-tree", "-r", "--full-tree", tree])
+}
+
+fn assert_trees_equal(repo_dir: &Path, actual: &str, expected: &str, label: &str) {
+    if actual == expected {
+        return;
+    }
+    let actual_dump = tree_dump(repo_dir, actual);
+    let expected_dump = tree_dump(repo_dir, expected);
+    eprintln!("{label}: overlay tree hash: {actual}");
+    eprintln!("{label}: fallback tree hash: {expected}");
+    eprintln!("{label}: overlay tree dump:\n{actual_dump}");
+    eprintln!("{label}: fallback tree dump:\n{expected_dump}");
+    panic!("{label}: tree hash mismatch between overlay-backed and fallback-backed upper layers");
+}
+
 #[test]
 fn fallback_backend_tree_matches_expected_git_tree() {
     let (repo_dir, repo, parent) = setup_repo();
@@ -174,7 +205,7 @@ fn overlayfs_backend_tree_matches_fallback_tree_when_enabled() {
     LinuxOverlayBackend.unmount(&paths).unwrap();
     assert!(paths.upper.join("README.md").exists());
     let actual = repo.tree_from_layer(&parent, &paths.upper).unwrap();
-    assert_eq!(actual, expected);
+    assert_trees_equal(&repo_dir, &actual, &expected, "overlayfs_backend_tree");
     fs::remove_dir_all(repo_dir).unwrap();
     fs::remove_dir_all(fallback_root).unwrap();
     fs::remove_dir_all(root).unwrap();
@@ -246,7 +277,7 @@ fn rofs_overlay_backend_tree_matches_fallback_tree_when_enabled() {
     );
     LinuxOverlayBackend.unmount(&paths).unwrap();
     let actual = repo.tree_from_layer(&parent, &paths.upper).unwrap();
-    assert_eq!(actual, expected);
+    assert_trees_equal(&repo_dir, &actual, &expected, "rofs_overlay_backend_tree");
     rofs.unmount().unwrap();
     fs::remove_dir_all(repo_dir).unwrap();
     fs::remove_dir_all(fallback_root).unwrap();

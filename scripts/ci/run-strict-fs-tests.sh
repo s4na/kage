@@ -4,7 +4,7 @@ set -euo pipefail
 mkdir -p target/ci-proof target/ci-logs
 results=target/ci-proof/results.env
 : > "$results"
-STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-240}"
+STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
 
 if [[ -n "${KAGE_TEST_ROFS_ALLOW_SKIP:-}" || -n "${KAGE_TEST_OVERLAY_ALLOW_SKIP:-}" ]]; then
   echo "allow_skip_used=true" >> "$results"
@@ -65,42 +65,56 @@ aggregate_status() {
 }
 error_kind_from_log() {
   local log="$1"
-  if grep -Eqi 'Invalid argument|os error 22|EINVAL' "$log"; then
+  local body
+  body="$(tail -n +2 "$log" 2>/dev/null || true)"
+  if grep -Eqi 'Invalid argument|os error 22|EINVAL' <<<"$body"; then
     printf '%s' direct_mount_einval
-  elif grep -Eqi 'timed out|timeout|Command exited with non-zero status 124' "$log"; then
-    printf '%s' timeout
-  elif grep -Eqi 'Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN' "$log"; then
-    printf '%s' permission_denied
-  elif grep -Eqi '/dev/fuse is unavailable|No such file or directory.*/dev/fuse' "$log"; then
+  elif grep -Eqi '/dev/fuse is unavailable|No such file or directory.*/dev/fuse' <<<"$body"; then
     printf '%s' missing_dev_fuse
-  elif grep -Eqi 'appears as both a file and as a directory|cannot add to the index|git update-index' "$log"; then
+  elif grep -Eqi 'timed out|timeout|Command exited with non-zero status 124' <<<"$body"; then
+    printf '%s' timeout
+  elif grep -Eqi 'Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN' <<<"$body"; then
+    printf '%s' permission_denied
+  elif grep -Eqi 'appears as both a file and as a directory|cannot add to the index|git update-index|tree hash mismatch|assertion.*left.*right' <<<"$body"; then
     printf '%s' git_index_conflict
   else
     printf '%s' unknown
   fi
 }
 record_rofs_probe_statuses() {
-  echo "kage_rofs_non_sudo_mount_status=$(status_value strict_rofs_nonsudo_status)" >> "$results"
-  echo "kage_rofs_non_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_nonsudo.log)" >> "$results"
-  echo "kage_rofs_sudo_mount_status=$(status_value strict_rofs_sudo_status)" >> "$results"
-  echo "kage_rofs_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_sudo.log)" >> "$results"
+  local nonsudo_status
+  local sudo_status
+  nonsudo_status="$(status_value strict_rofs_nonsudo_status)"
+  sudo_status="$(status_value strict_rofs_sudo_status)"
+  echo "kage_rofs_non_sudo_mount_status=$nonsudo_status" >> "$results"
+  if [[ "$nonsudo_status" == "0" ]]; then
+    echo "kage_rofs_non_sudo_mount_error_kind=none" >> "$results"
+  else
+    echo "kage_rofs_non_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_nonsudo.log)" >> "$results"
+  fi
+  echo "kage_rofs_sudo_mount_status=$sudo_status" >> "$results"
+  if [[ "$sudo_status" == "0" ]]; then
+    echo "kage_rofs_sudo_mount_error_kind=none" >> "$results"
+  else
+    echo "kage_rofs_sudo_mount_error_kind=$(error_kind_from_log target/ci-logs/strict_rofs_sudo.log)" >> "$results"
+  fi
 }
 
-run_case strict_rofs_nonsudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib -- --nocapture rofs_mount_strict_requires_real_read_only_mount
-run_sudo_case strict_rofs_sudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib -- --nocapture rofs_mount_strict_requires_real_read_only_mount
+run_case strict_rofs_nonsudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib tests::rofs_mount_strict_requires_real_read_only_mount -- --exact --nocapture --test-threads=1
+run_sudo_case strict_rofs_sudo env KAGE_TEST_ROFS=1 cargo test -p kage-rofs --lib tests::rofs_mount_strict_requires_real_read_only_mount -- --exact --nocapture --test-threads=1
 record_rofs_probe_statuses
 aggregate_status strict_rofs strict_rofs_nonsudo_status strict_rofs_sudo_status
 
-run_case strict_overlay_nonsudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees -- --nocapture overlayfs_backend_tree_matches_fallback_tree_when_enabled
-run_sudo_case strict_overlay_sudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees -- --nocapture overlayfs_backend_tree_matches_fallback_tree_when_enabled
+run_case strict_overlay_nonsudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_sudo_case strict_overlay_sudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_overlay strict_overlay_nonsudo_status strict_overlay_sudo_status
 
-run_case strict_combined_nonsudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture
-run_sudo_case strict_combined_sudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test --workspace --all-features -- --nocapture
+run_case strict_combined_nonsudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_sudo_case strict_combined_sudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_combined strict_combined_nonsudo_status strict_combined_sudo_status
 
-run_case strict_runtime_nonsudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test --workspace --all-features -- --nocapture
-run_sudo_case strict_runtime_sudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test --workspace --all-features -- --nocapture
+run_case strict_runtime_nonsudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_sudo_case strict_runtime_sudo env KAGE_TEST_ROFS=1 KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_runtime strict_runtime_nonsudo_status strict_runtime_sudo_status
 
 cat "$results"
