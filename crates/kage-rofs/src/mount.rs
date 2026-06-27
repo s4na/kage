@@ -85,6 +85,10 @@ pub fn mount_rofs_strict(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMo
     if backend == RofsBackend::Fuser {
         return fuser_backend::mount_rofs_fuser(view, mountpoint);
     }
+    mount_rofs_handwritten(view, mountpoint)
+}
+
+pub(crate) fn mount_rofs_handwritten(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMount> {
     if !rofs_mount_available() {
         return Err("/dev/fuse is unavailable; cannot mount kage-rofs".into());
     }
