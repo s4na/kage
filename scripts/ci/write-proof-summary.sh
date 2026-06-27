@@ -58,9 +58,20 @@ LOG_BY_NAME = {
     "containerized_combined": "target/ci-logs/container_strict_combined.log",
     "containerized_runtime": "target/ci-logs/container_strict_runtime.log",
 }
+LOG_GROUPS = {
+    "strict_rofs": ["strict_rofs_nonsudo", "strict_rofs_sudo"],
+    "strict_overlay": ["strict_overlay_nonsudo", "strict_overlay_sudo"],
+    "strict_combined": ["strict_combined_nonsudo", "strict_combined_sudo"],
+    "strict_runtime": ["strict_runtime_nonsudo", "strict_runtime_sudo"],
+}
 def log_has_zero_tests(name):
-    path = Path(LOG_BY_NAME.get(name, ""))
-    if not path.exists():
+    if name in LOG_GROUPS:
+        return any(log_has_zero_tests(member) for member in LOG_GROUPS[name])
+    log_path = LOG_BY_NAME.get(name)
+    if not log_path:
+        return False
+    path = Path(log_path)
+    if not path.is_file():
         return False
     return bool(zero_test_re.search(path.read_text(encoding="utf-8", errors="replace")))
 

@@ -8,6 +8,7 @@ mkdir -p target/ci-proof target/ci-logs scripts/ci
 cp "$root/scripts/ci/write-proof-summary.sh" scripts/ci/write-proof-summary.sh
 cat > target/ci-proof/results.env <<'ENV'
 allow_skip_used=false
+strict_rofs_status=0
 strict_rofs_sudo_status=0
 strict_overlay_sudo_status=0
 strict_combined_sudo_status=1
