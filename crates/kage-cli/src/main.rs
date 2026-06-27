@@ -186,6 +186,9 @@ fn workspace(paths: RuntimePaths, args: &[String]) -> Result<()> {
     }
 }
 fn rofs_serve(args: &[String]) -> Result<()> {
+    if env::var_os("KAGE_TEST_ROFS_FORCE_STARTUP_FAILURE").is_some() {
+        return Err("forced kage-rofs startup failure for test".into());
+    }
     let repo = PathBuf::from(flag(args, "--repo").ok_or("missing --repo")?);
     let reference = flag(args, "--ref").ok_or("missing --ref")?;
     let mountpoint = PathBuf::from(flag(args, "--mountpoint").ok_or("missing --mountpoint")?);

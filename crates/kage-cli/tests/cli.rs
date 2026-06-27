@@ -58,6 +58,15 @@ fn kage(home: &PathBuf, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn kage_with_env(home: &PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kage"));
+    command.arg("--home").arg(home).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
 #[test]
 fn workspace_lifecycle_diff_commit_and_discard() {
     let repo = setup_repo();
@@ -231,7 +240,7 @@ fn workspace_create_records_exported_lower_and_rejects_git_rofs_with_fallback_ba
 fn git_rofs_overlay_startup_failure_does_not_record_workspace_or_fallback() {
     let repo = setup_repo();
     let home = temp("home");
-    let out = kage(
+    let out = kage_with_env(
         &home,
         &[
             "workspace",
@@ -247,6 +256,7 @@ fn git_rofs_overlay_startup_failure_does_not_record_workspace_or_fallback() {
             "--lower",
             "git-rofs",
         ],
+        &[("KAGE_TEST_ROFS_FORCE_STARTUP_FAILURE", "1")],
     );
     assert!(
         !out.status.success(),
@@ -255,6 +265,7 @@ fn git_rofs_overlay_startup_failure_does_not_record_workspace_or_fallback() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("kage-rofs daemon exited during mount")
+            || stderr.contains("forced kage-rofs startup failure")
             || stderr.contains("/dev/fuse")
             || stderr.contains("fuse mount failed")
             || stderr.contains("permission"),
