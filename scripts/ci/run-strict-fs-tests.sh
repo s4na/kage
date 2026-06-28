@@ -118,8 +118,8 @@ record_rofs_probe_statuses() {
   fi
 }
 
-run_case strict_rofs_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
-run_sudo_case strict_rofs_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
+run_case strict_rofs_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
+run_sudo_case strict_rofs_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser cargo test -p kage-rofs --lib rofs_mount_strict_requires_real_read_only_mount -- --nocapture --test-threads=1
 record_rofs_probe_statuses
 aggregate_status strict_rofs strict_rofs_nonsudo_status strict_rofs_sudo_status
 
@@ -127,12 +127,12 @@ run_case strict_overlay_nonsudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git -
 run_sudo_case strict_overlay_sudo env KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees overlayfs_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_overlay strict_overlay_nonsudo_status strict_overlay_sudo_status
 
-run_case strict_combined_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
-run_sudo_case strict_combined_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_case strict_combined_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
+run_sudo_case strict_combined_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 cargo test -p kage-git --test backend_trees rofs_overlay_backend_tree_matches_fallback_tree_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_combined strict_combined_nonsudo_status strict_combined_sudo_status
 
-run_case strict_runtime_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
-run_sudo_case strict_runtime_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=handwritten KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_case strict_runtime_nonsudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
+run_sudo_case strict_runtime_sudo env KAGE_TEST_ROFS=1 KAGE_ROFS_BACKEND=fuser KAGE_TEST_OVERLAY=1 KAGE_TEST_RUNTIME=1 cargo test -p kage-cli --test cli strict_rofs_overlay_runtime_smoke_when_enabled -- --exact --nocapture --test-threads=1
 aggregate_status strict_runtime strict_runtime_nonsudo_status strict_runtime_sudo_status
 
 cat "$results"
