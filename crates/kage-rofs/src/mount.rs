@@ -24,7 +24,7 @@ pub enum RofsBackend {
 impl RofsBackend {
     pub fn selected() -> Result<Self> {
         match std::env::var("KAGE_ROFS_BACKEND").ok().as_deref() {
-            None | Some("") => Ok(Self::Handwritten),
+            None | Some("") => Ok(Self::Fuser),
             Some("fuser") => Ok(Self::Fuser),
             Some("handwritten") => Ok(Self::Handwritten),
             Some(other) => Err(format!(
@@ -42,40 +42,76 @@ impl RofsBackend {
     }
 }
 
-#[derive(Debug)]
-pub struct RofsMount {
-    mountpoint: PathBuf,
-    fd: RawFd,
-    worker: Option<JoinHandle<()>>,
+pub enum RofsMount {
+    Fuser {
+        mountpoint: PathBuf,
+        session: Option<fuser::BackgroundSession>,
+    },
+    Handwritten {
+        mountpoint: PathBuf,
+        fd: RawFd,
+        worker: Option<JoinHandle<()>>,
+    },
+}
+
+impl std::fmt::Debug for RofsMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fuser { mountpoint, .. } => f
+                .debug_struct("RofsMount::Fuser")
+                .field("mountpoint", mountpoint)
+                .finish_non_exhaustive(),
+            Self::Handwritten { mountpoint, fd, .. } => f
+                .debug_struct("RofsMount::Handwritten")
+                .field("mountpoint", mountpoint)
+                .field("fd", fd)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl RofsMount {
+    pub(crate) fn fuser(mountpoint: PathBuf, session: fuser::BackgroundSession) -> Self {
+        Self::Fuser {
+            mountpoint,
+            session: Some(session),
+        }
+    }
+
     pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
+        match self {
+            Self::Fuser { mountpoint, .. } | Self::Handwritten { mountpoint, .. } => mountpoint,
+        }
     }
 
     pub fn unmount(mut self) -> Result<()> {
-        unmount_path(&self.mountpoint)?;
-        unsafe {
-            close_fd(self.fd);
+        self.unmount_inner()
+    }
+
+    fn unmount_inner(&mut self) -> Result<()> {
+        let mountpoint = self.mountpoint().to_path_buf();
+        let unmount_result = unmount_path(&mountpoint);
+        match self {
+            Self::Fuser { session, .. } => {
+                drop(session.take());
+            }
+            Self::Handwritten { fd, worker, .. } => {
+                unsafe {
+                    close_fd(*fd);
+                }
+                *fd = -1;
+                if let Some(worker) = worker.take() {
+                    let _ = worker.join();
+                }
+            }
         }
-        self.fd = -1;
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        Ok(())
+        unmount_result
     }
 }
 
 impl Drop for RofsMount {
     fn drop(&mut self) {
-        let _ = unmount_path(&self.mountpoint);
-        unsafe {
-            close_fd(self.fd);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let _ = self.unmount_inner();
     }
 }
 
@@ -106,7 +142,7 @@ pub(crate) fn mount_rofs_handwritten(view: &GitTreeView, mountpoint: &Path) -> R
     let server = FuseServer::new(view.clone());
     let worker_fd = fd;
     let worker = thread::spawn(move || server.serve(worker_fd));
-    Ok(RofsMount {
+    Ok(RofsMount::Handwritten {
         mountpoint: mountpoint.to_path_buf(),
         fd,
         worker: Some(worker),
