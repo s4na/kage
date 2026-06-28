@@ -212,7 +212,7 @@ impl Filesystem for FuserRofs {
             all.push((entry_ino, kind, name));
         }
         for (idx, (entry_ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(entry_ino, (idx + 1) as i64, kind, name) {
+            if reply.add(entry_ino, (idx + 1) as u64, kind, name) {
                 break;
             }
         }
