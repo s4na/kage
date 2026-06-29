@@ -16,6 +16,26 @@ use std::{
 
 const TTL: Duration = Duration::from_secs(1);
 
+fn trace_enabled() -> bool {
+    std::env::var_os("KAGE_TEST_ROFS").is_some() || std::env::var_os("KAGE_ROFS_TRACE").is_some()
+}
+
+macro_rules! rofs_trace {
+    ($($arg:tt)*) => {
+        if trace_enabled() {
+            eprintln!("kage-rofs fuser trace: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+fn path_display(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        "/".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
 pub fn mount_rofs_fuser(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMount> {
     std::fs::create_dir_all(mountpoint)?;
     let fs = FuserRofs::new(view.clone());
@@ -28,8 +48,10 @@ pub fn mount_rofs_fuser(view: &GitTreeView, mountpoint: &Path) -> Result<RofsMou
         MountOption::FSName("kage-rofs".to_string()),
         MountOption::Subtype("kage-rofs".to_string()),
     ];
+    rofs_trace!("mount enter mountpoint={}", mountpoint.display());
     let session = fuser::spawn_mount2(fs, mountpoint, &config)
         .map_err(|err| format!("backend=fuser error_kind=fuser_mount_error error_detail={err}"))?;
+    rofs_trace!("mount exit result=ok mountpoint={}", mountpoint.display());
     Ok(RofsMount::fuser(mountpoint.to_path_buf(), session))
 }
 
@@ -90,10 +112,18 @@ impl FuserRofs {
 
 impl Filesystem for FuserRofs {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+        rofs_trace!("init enter");
+        rofs_trace!("init exit result=ok");
         Ok(())
     }
 
+    fn destroy(&mut self) {
+        rofs_trace!("destroy enter");
+        rofs_trace!("destroy exit result=ok");
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        rofs_trace!("lookup enter parent={} name={:?}", parent.0, name);
         let Some(parent_path) = self.path_for(parent) else {
             reply.error(Errno::ENOENT);
             return;
@@ -113,6 +143,7 @@ impl Filesystem for FuserRofs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        rofs_trace!("getattr enter ino={}", ino.0);
         let Some(path) = self.path_for(ino) else {
             reply.error(Errno::ENOENT);
             return;
@@ -124,6 +155,7 @@ impl Filesystem for FuserRofs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        rofs_trace!("open enter ino={} flags={:?}", ino.0, flags);
         if flags.acc_mode() != OpenAccMode::O_RDONLY {
             reply.error(Errno::EROFS);
             return;
@@ -162,13 +194,38 @@ impl Filesystem for FuserRofs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        rofs_trace!("read enter ino={} offset={} size={}", ino.0, offset, size);
         let Some(path) = self.path_for(ino) else {
+            rofs_trace!("read exit ino={} result=err error=ENOENT", ino.0);
             reply.error(Errno::ENOENT);
             return;
         };
+        rofs_trace!("read resolved ino={} path={}", ino.0, path_display(&path));
         match self.view.read_file(&path, offset, size as usize) {
-            Ok(bytes) => reply.data(&bytes),
-            Err(_) => reply.error(Errno::EINVAL),
+            Ok(bytes) => {
+                rofs_trace!(
+                    "read_file returned ino={} path={} result=ok bytes={}",
+                    ino.0,
+                    path_display(&path),
+                    bytes.len()
+                );
+                reply.data(&bytes);
+                rofs_trace!(
+                    "read exit ino={} path={} result=ok reply=data bytes={}",
+                    ino.0,
+                    path_display(&path),
+                    bytes.len()
+                );
+            }
+            Err(err) => {
+                rofs_trace!(
+                    "read exit ino={} path={} result=err error=EINVAL detail={}",
+                    ino.0,
+                    path_display(&path),
+                    err
+                );
+                reply.error(Errno::EINVAL);
+            }
         }
     }
 
@@ -180,6 +237,7 @@ impl Filesystem for FuserRofs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        rofs_trace!("readdir enter ino={} offset={}", ino.0, offset);
         let Some(path) = self.path_for(ino) else {
             reply.error(Errno::ENOENT);
             return;
@@ -220,6 +278,7 @@ impl Filesystem for FuserRofs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        rofs_trace!("readlink enter ino={}", ino.0);
         let Some(path) = self.path_for(ino) else {
             reply.error(Errno::ENOENT);
             return;
@@ -230,11 +289,13 @@ impl Filesystem for FuserRofs {
         }
     }
 
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        rofs_trace!("statfs enter ino={}", ino.0);
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 512);
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        rofs_trace!("access enter ino={} mask={:?}", ino.0, mask);
         if mask.contains(AccessFlags::W_OK) {
             reply.error(Errno::EACCES);
             return;

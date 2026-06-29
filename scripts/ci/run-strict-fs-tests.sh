@@ -5,6 +5,15 @@ mkdir -p target/ci-proof target/ci-logs
 results=target/ci-proof/results.env
 : > "$results"
 STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
+cleanup_fuse_mounts() {
+  findmnt -rn -t fuse,fuse.kage-rofs 2>/dev/null | awk '/kage-rofs/ {print $1}' | while read -r mp; do
+    [ -n "$mp" ] || continue
+    echo "cleanup kage-rofs mount: $mp"
+    fusermount3 -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+  done
+  pkill -f "target/.*/(kage-rofs|kage-cli)|rofs_mount_strict_requires_real_read_only_mount" 2>/dev/null || true
+}
+trap cleanup_fuse_mounts EXIT INT TERM
 
 if [[ -n "${KAGE_TEST_ROFS_ALLOW_SKIP:-}" || -n "${KAGE_TEST_OVERLAY_ALLOW_SKIP:-}" ]]; then
   echo "allow_skip_used=true" >> "$results"
@@ -21,9 +30,10 @@ run_case() {
   local log="target/ci-logs/${name}.log"
   echo "== $name: timeout ${STRICT_TEST_TIMEOUT_SECONDS}s $* ==" | tee "$log"
   set +e
-  timeout --preserve-status "${STRICT_TEST_TIMEOUT_SECONDS}s" "$@" >> "$log" 2>&1
+  timeout --kill-after=10s --preserve-status "${STRICT_TEST_TIMEOUT_SECONDS}s" "$@" >> "$log" 2>&1
   local status=$?
   set -e
+  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then cleanup_fuse_mounts >> "$log" 2>&1 || true; fi
   record_status "$name" "$status"
   record_zero_test_failure "$name"
   printf '%s_command=%q\n' "$name" "$(printf '%q ' "$@")" >> "$results"
@@ -89,8 +99,14 @@ error_kind_from_log() {
     printf '%s' direct_mount_einval
   elif grep -Eqi '/dev/fuse is unavailable|No such file or directory.*/dev/fuse' <<<"$body"; then
     printf '%s' missing_dev_fuse
+  elif grep -Eqi 'fuser_first_read_timeout' <<<"$body"; then
+    printf '%s' fuser_first_read_timeout
+  elif grep -Eqi 'fuser_readdir_timeout' <<<"$body"; then
+    printf '%s' fuser_readdir_timeout
+  elif grep -Eqi 'fuser_unmount_timeout' <<<"$body"; then
+    printf '%s' fuser_unmount_timeout
   elif grep -Eqi 'timed out|timeout|Command exited with non-zero status 124' <<<"$body"; then
-    printf '%s' timeout
+    printf '%s' strict_command_timeout
   elif grep -Eqi 'Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN' <<<"$body"; then
     printf '%s' permission_denied
   elif grep -Eqi 'appears as both a file and as a directory|cannot add to the index|git update-index|tree hash mismatch|assertion.*left.*right' <<<"$body"; then

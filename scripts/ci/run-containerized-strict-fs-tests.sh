@@ -15,6 +15,13 @@ host_container_env=target/ci-proof/container-host.env
 : > "$container_env"
 : > "$host_container_env"
 STRICT_TEST_TIMEOUT_SECONDS="${STRICT_TEST_TIMEOUT_SECONDS:-90}"
+CONTAINER_STRICT_TIMEOUT_SECONDS="${CONTAINER_STRICT_TIMEOUT_SECONDS:-600}"
+CIDFILE="target/ci-proof/container.cid"
+rm -f "$CIDFILE"
+cleanup_container() {
+  if [ -f "$CIDFILE" ]; then docker rm -f "$(cat "$CIDFILE")" >/dev/null 2>&1 || true; rm -f "$CIDFILE"; fi
+}
+trap cleanup_container EXIT INT TERM
 IMAGE="${KAGE_CONTAINER_STRICT_IMAGE:-kage-strict:ci}"
 DOCKERFILE="${KAGE_CONTAINER_STRICT_DOCKERFILE:-.github/docker/kage-strict/Dockerfile}"
 
@@ -54,7 +61,10 @@ error_kind_from_log() {
   elif grep -Eqi "fuser_backend_unavailable|fuser_mount_error" "$log"; then echo fuser_backend_failure
   elif grep -Eqi "Invalid argument|os error 22|EINVAL" "$log"; then echo direct_mount_einval
   elif grep -Eqi "/dev/fuse is unavailable|No such file or directory.*/dev/fuse" "$log"; then echo missing_dev_fuse
-  elif grep -Eqi "timed out|timeout|Command exited with non-zero status 124" "$log"; then echo timeout
+  elif grep -Eqi "fuser_first_read_timeout" "$log"; then echo fuser_first_read_timeout
+  elif grep -Eqi "fuser_readdir_timeout" "$log"; then echo fuser_readdir_timeout
+  elif grep -Eqi "fuser_unmount_timeout" "$log"; then echo fuser_unmount_timeout
+  elif grep -Eqi "timed out|timeout|Command exited with non-zero status 124" "$log"; then echo strict_command_timeout
   elif grep -Eqi "Operation not permitted|os error 1|EPERM|must be superuser|CAP_SYS_ADMIN|permission denied" "$log"; then echo permission_denied
   elif grep -Eqi "appears as both a file and as a directory|cannot add to the index|git update-index|tree hash mismatch|assertion.*left.*right" "$log"; then echo tree_mismatch
   else echo unknown
@@ -66,9 +76,10 @@ run_strict() {
   local log="/out/logs/container_strict_${name}.log"
   echo "== container ${name}: timeout ${STRICT_TEST_TIMEOUT_SECONDS}s $* ==" | tee "$log"
   set +e
-  timeout --preserve-status "${STRICT_TEST_TIMEOUT_SECONDS}s" "$@" >> "$log" 2>&1
+  timeout --kill-after=10s --preserve-status "${STRICT_TEST_TIMEOUT_SECONDS}s" "$@" >> "$log" 2>&1
   local st=$?
   set -e
+  if [ "$st" -eq 124 ] || [ "$st" -eq 137 ]; then findmnt -rn -t fuse,fuse.kage-rofs 2>/dev/null | awk '/kage-rofs/ {print $1}' | while read -r mp; do fusermount3 -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true; done >> "$log" 2>&1 || true; fi
   record "containerized_${name}_attempted" true
   if [ "$st" -eq 0 ] && zero_test_log "$log"; then
     st=2
@@ -130,7 +141,7 @@ cat /out/proof/container.env
 '
 
 run_container() {
-  docker run --rm \
+  timeout --kill-after=10s "${CONTAINER_STRICT_TIMEOUT_SECONDS}s" docker run --cidfile "$CIDFILE" \
     --privileged \
     --device /dev/fuse \
     --cap-add SYS_ADMIN \
@@ -153,6 +164,7 @@ if [ "$status" -ne 0 ]; then
   echo "containerized privileged run with apparmor=unconfined exited $status; retrying without apparmor" | tee -a target/ci-logs/container_probe.log
   echo "containerized_apparmor_unconfined_status=$status" >> "$host_container_env"
   set +e
+  cleanup_container
   run_container
   status=$?
   set -e
