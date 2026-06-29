@@ -200,6 +200,9 @@ fn rofs_serve(args: &[String]) -> Result<()> {
 }
 
 fn start_rofs_daemon(ws: &WorkspaceSpec) -> Result<()> {
+    if env::var_os("KAGE_TEST_ROFS_FORCE_STARTUP_FAILURE").is_some() {
+        return Err("forced kage-rofs startup failure for test".into());
+    }
     fs::create_dir_all(&ws.lower)?;
     let exe = env::current_exe()?;
     let root = ws

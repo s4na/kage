@@ -431,10 +431,8 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         path::Path,
-        process::Command,
-        sync::mpsc,
-        thread,
-        time::Duration,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -770,23 +768,38 @@ mod tests {
             );
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = rofs_mount_strict_test_body();
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
-                eprintln!("WARNING: skipping rofs mount body: {err}");
+        if std::env::var_os("KAGE_ROFS_STRICT_CHILD").is_some() {
+            match rofs_mount_strict_test_body() {
+                Ok(()) => return,
+                Err(err) if std::env::var_os("KAGE_TEST_ROFS_ALLOW_SKIP").is_some() => {
+                    eprintln!("WARNING: skipping rofs mount body: {err}");
+                    return;
+                }
+                Err(err) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
             }
-            Ok(Err(err)) => panic!("KAGE_TEST_ROFS=1 requires a real rofs mount: {err}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-                "KAGE_TEST_ROFS=1 rofs strict mount body timed out after 20s; inspect helper/direct mount diagnostics"
-            ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("KAGE_TEST_ROFS=1 rofs strict mount body exited without reporting a result")
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("rofs_mount_strict_requires_real_read_only_mount")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("KAGE_ROFS_STRICT_CHILD", "1")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn strict rofs child test process");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll strict rofs child") {
+                assert!(status.success(), "strict rofs child failed with {status}");
+                return;
             }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("error_kind=fuser_first_read_timeout KAGE_TEST_ROFS=1 rofs strict command timed out after 20s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
